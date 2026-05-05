@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Book Your Return Stay</title>
+  <link rel="stylesheet" href="/style.css" />
+  <script src="/config.js"></script>
+</head>
+<body>
+  <header class="hero">
+    <div class="container hero-inner">
+      <div class="brand-mark" id="brandMark">M</div>
+      <h1 id="brandName">Welcome Back</h1>
+      <p id="tagline" class="tagline">A small, private booking page for past guests of our properties. Skip Airbnb fees and book directly.</p>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- STEP 1: Email lookup -->
+    <section id="step-lookup" class="card">
+      <h2>Have you stayed with us before?</h2>
+      <p class="muted">Enter the email you used to book. We'll find your past stays and let you reserve another.</p>
+      <form id="lookupForm" class="lookup-form">
+        <input type="email" id="emailInput" placeholder="you@example.com" required />
+        <button type="submit" class="btn-primary">Continue</button>
+      </form>
+      <p id="lookupError" class="error hidden"></p>
+    </section>
+
+    <!-- STEP 2: Welcome + property picker + booking form (hidden initially) -->
+    <section id="step-book" class="card hidden">
+      <h2>Welcome back, <span id="guestName">friend</span></h2>
+      <div id="pastStays"></div>
+
+      <h3 style="margin-top:24px;">Book your next stay</h3>
+      <form id="bookForm">
+        <label>
+          <span>Which property?</span>
+          <select id="propertySelect" required></select>
+        </label>
+        <div id="welcomeBox" class="welcome-box hidden"></div>
+        <div class="grid-2">
+          <label>
+            <span>Check-in</span>
+            <input type="date" id="checkIn" required />
+          </label>
+          <label>
+            <span>Check-out</span>
+            <input type="date" id="checkOut" />
+          </label>
+        </div>
+        <label>
+          <span>What you'd like to pay <span class="muted">(I'll confirm before charging)</span></span>
+          <input type="number" id="amount" step="1" placeholder="e.g. 750" />
+        </label>
+        <label>
+          <span>Any notes for me?</span>
+          <textarea id="message" rows="3" placeholder="How many guests, requests, anything else..."></textarea>
+        </label>
+        <button type="submit" class="btn-primary">Send booking request</button>
+      </form>
+      <p id="bookError" class="error hidden"></p>
+    </section>
+
+    <!-- STEP 3: Success -->
+    <section id="step-success" class="card hidden success-card">
+      <div class="success-mark">✓</div>
+      <h2>Got it. I'll be in touch shortly.</h2>
+      <p>Your booking request has been sent. I'll review and confirm by email within a day.</p>
+      <button id="restartBtn" class="btn-ghost">Submit another</button>
+    </section>
+
+    <!-- Not a returning guest -->
+    <section id="step-notfound" class="card hidden">
+      <h2>I don't see your email in our records yet.</h2>
+      <p class="muted">This page is for returning guests. If you've stayed with me before but used a different email, try that one. Otherwise, please book through Airbnb or VRBO for a first-time stay.</p>
+      <button id="tryAgainBtn" class="btn-ghost">Try a different email</button>
+    </section>
+  </main>
+
+  <footer>
+    <p class="muted small">A direct booking page for repeat guests. Hosted by you, for you.</p>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

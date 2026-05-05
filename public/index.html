@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rental Tracker</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Rental Tracker</div>
+    <nav class="tabs">
+      <button class="tab active" data-view="dashboard">Dashboard</button>
+      <button class="tab" data-view="properties">Properties</button>
+      <button class="tab" data-view="calendar">Booking Calendar</button>
+      <button class="tab" data-view="bookings">Bookings</button>
+      <button class="tab" data-view="requests">Requests<span id="requestsBadge" class="pill hidden">0</span></button>
+      <button class="tab" data-view="todos">To Do<span id="todosBadge" class="pill hidden">0</span></button>
+      <button class="tab" data-view="guests">Guests</button>
+      <button class="tab" data-view="cleaners">Cleaners</button>
+      <div class="tab-group">
+        <button class="tab tools-toggle" id="toolsToggle">Tools <span class="caret">&#9662;</span></button>
+        <div class="tab-dropdown hidden" id="toolsDropdown">
+          <button class="dropdown-item" data-view="bulk">Bulk Import</button>
+          <button class="dropdown-item" data-view="mailing">Mailing List</button>
+          <button class="dropdown-item" data-view="maintenance">Maintenance</button>
+          <button class="dropdown-item" data-view="cleanerCal">Cleaner Calendar</button>
+          <button class="dropdown-item" data-view="licensing">Licensing</button>
+          <button class="dropdown-item" data-view="smsInbox">SMS Inbox</button>
+        </div>
+      </div>
+    </nav>
+    <button id="syncAllBtn" class="btn-primary small">Sync all calendars</button>
+  </header>
+
+  <main id="app"></main>
+
+  <div id="modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3 id="modalTitle">Title</h3>
+        <button id="modalClose" class="icon-btn" aria-label="Close">&times;</button>
+      </div>
+      <div id="modalBody"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
