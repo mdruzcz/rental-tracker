@@ -1,5 +1,9 @@
 node_modules/
 rental.db.json
 uploads/
+backups/
 .env
+.env.*
+!.env.example
 *.log
+.vercel

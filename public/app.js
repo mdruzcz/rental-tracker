@@ -25,11 +25,20 @@
   const fmtMoney = (n) => new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 }).format(n || 0);
   const fmtDate = (d) => {
     if (!d) return '';
+    // Parse YYYY-MM-DD as local date to avoid UTC timezone shift
+    const parts = String(d).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (parts) {
+      const dt = new Date(Number(parts[1]), Number(parts[2]) - 1, Number(parts[3]));
+      return dt.toLocaleDateString('en-CA', { year: 'numeric', month: 'short', day: 'numeric' });
+    }
     const dt = new Date(d);
     if (isNaN(dt)) return d;
     return dt.toLocaleDateString('en-CA', { year: 'numeric', month: 'short', day: 'numeric' });
   };
-  const isoToday = () => new Date().toISOString().slice(0, 10);
+  const isoToday = () => {
+    const n = new Date();
+    return n.getFullYear() + '-' + String(n.getMonth() + 1).padStart(2, '0') + '-' + String(n.getDate()).padStart(2, '0');
+  };
   const slug = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   const pct = (x) => (x == null ? '—' : (Math.round(x * 1000) / 10) + '%');
 
@@ -42,10 +51,63 @@
     setTimeout(() => t.classList.add('hidden'), 2800);
   }
 
+  // ---------- auth (Supabase, dependency-free) ----------
+  const Auth = {
+    url: null, anonKey: null, session: null,
+    async loadConfig() {
+      if (this.url) return;
+      const cfg = await fetch('/api/public/auth-config').then(r => r.json());
+      this.url = cfg.url; this.anonKey = cfg.anonKey;
+    },
+    restore() { try { this.session = JSON.parse(localStorage.getItem('rt_session') || 'null'); } catch (e) { this.session = null; } return this.session; },
+    persist() { if (this.session) localStorage.setItem('rt_session', JSON.stringify(this.session)); else localStorage.removeItem('rt_session'); },
+    isValid() { return !!(this.session && this.session.access_token && this.session.expires_at && (this.session.expires_at * 1000 - 30000) > Date.now()); },
+    _setFromResponse(data, fallbackEmail) {
+      this.session = { access_token: data.access_token, refresh_token: data.refresh_token, expires_at: data.expires_at, email: (data.user && data.user.email) || fallbackEmail };
+      this.persist();
+    },
+    async login(email, password) {
+      await this.loadConfig();
+      const r = await fetch(`${this.url}/auth/v1/token?grant_type=password`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', apikey: this.anonKey },
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error_description || data.msg || data.error || 'Login failed');
+      this._setFromResponse(data, email);
+    },
+    async refresh() {
+      if (!this.session || !this.session.refresh_token) return false;
+      await this.loadConfig();
+      const r = await fetch(`${this.url}/auth/v1/token?grant_type=refresh_token`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', apikey: this.anonKey },
+        body: JSON.stringify({ refresh_token: this.session.refresh_token }),
+      });
+      if (!r.ok) { this.logout(); return false; }
+      const data = await r.json().catch(() => ({}));
+      this._setFromResponse(data, this.session.email);
+      return true;
+    },
+    logout() { this.session = null; this.persist(); },
+    async token() {
+      if (this.isValid()) return this.session.access_token;
+      if (this.session && this.session.refresh_token) { if (await this.refresh()) return this.session.access_token; }
+      return null;
+    },
+  };
+
   async function api(method, url, body) {
-    const opts = { method, headers: { 'Content-Type': 'application/json' } };
+    const token = await Auth.token();
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers.Authorization = 'Bearer ' + token;
+    const opts = { method, headers };
     if (body) opts.body = JSON.stringify(body);
     const r = await fetch(url, opts);
+    if (r.status === 401) {
+      Auth.logout();
+      if (typeof showLogin === 'function') showLogin('Your session expired — please sign in again.');
+      throw new Error('login required');
+    }
     if (!r.ok) {
       let msg = r.statusText;
       try { msg = (await r.json()).error || msg; } catch (e) {}
@@ -80,12 +142,60 @@
       update: (id, b) => api('PUT', `/api/licensing/${id}`, b),
       remove: (id) => api('DELETE', `/api/licensing/${id}`),
       seed: (propertyId) => api('POST', `/api/licensing/seed/${propertyId}`),
-      upload: (id, formData) => fetch(`/api/licensing/${id}/upload`, { method: 'POST', body: formData }).then(r => r.json()),
-      deleteFile: (id, filename) => api('DELETE', `/api/licensing/${id}/upload/${filename}`),
+      upload: async (id, formData) => {
+        const token = await Auth.token();
+        const r = await fetch(`/api/licensing/${id}/upload`, { method: 'POST', headers: token ? { Authorization: 'Bearer ' + token } : {}, body: formData });
+        if (!r.ok) { let m = 'upload failed'; try { m = (await r.json()).error || m; } catch (e) {} toast(m, 'error'); throw new Error(m); }
+        return r.json();
+      },
+      deleteFile: (id, objectPath) => api('DELETE', `/api/licensing/${id}/attachment?path=${encodeURIComponent(objectPath)}`),
     },
     sync: (id) => api('POST', `/api/sync/${id}`),
     syncAll: () => api('POST', '/api/sync-all'),
     calendar: () => api('GET', '/api/calendar'),
+    conflicts: () => api('GET', '/api/conflicts'),
+    claimSynced: (id, b) => api('POST', `/api/synced-events/${id}/claim`, b),
+    blocks: {
+      list: () => api('GET', '/api/blocks'),
+      create: (b) => api('POST', '/api/blocks', b),
+      remove: (id) => api('DELETE', `/api/blocks/${id}`),
+    },
+    // --- Profit & automation (Phases C–H) ---
+    expenses: {
+      list: (params) => api('GET', '/api/expenses' + (params ? '?' + new URLSearchParams(params) : '')),
+      create: (b) => api('POST', '/api/expenses', b),
+      update: (id, b) => api('PUT', `/api/expenses/${id}`, b),
+      remove: (id) => api('DELETE', `/api/expenses/${id}`),
+    },
+    upsells: {
+      list: () => api('GET', '/api/upsells'),
+      create: (b) => api('POST', '/api/upsells', b),
+      update: (id, b) => api('PUT', `/api/upsells/${id}`, b),
+      remove: (id) => api('DELETE', `/api/upsells/${id}`),
+    },
+    bookingUpsells: {
+      list: (bookingId) => api('GET', `/api/booking-upsells?booking_id=${bookingId}`),
+      create: (b) => api('POST', '/api/booking-upsells', b),
+      remove: (id) => api('DELETE', `/api/booking-upsells/${id}`),
+    },
+    reviews: {
+      list: () => api('GET', '/api/reviews'),
+      create: (b) => api('POST', '/api/reviews', b),
+      update: (id, b) => api('PUT', `/api/reviews/${id}`, b),
+      remove: (id) => api('DELETE', `/api/reviews/${id}`),
+    },
+    settings: {
+      get: () => api('GET', '/api/settings'),
+      update: (b) => api('PUT', '/api/settings', b),
+    },
+    bookingTypeUpdate: (id, b) => api('PUT', `/api/booking-types/${id}`, b),
+    financials: (year) => api('GET', '/api/financials' + (year ? '?year=' + year : '')),
+    orphans: () => api('GET', '/api/orphans'),
+    messageTemplates: { list: () => api('GET', '/api/message-templates'), update: (id, b) => api('PUT', `/api/message-templates/${id}`, b) },
+    messagesScheduled: () => api('GET', '/api/messages/scheduled'),
+    sendMessage: (b) => api('POST', '/api/messages/send', b),
+    pricelabs: { listings: () => api('GET', '/api/pricelabs/listings'), refresh: () => api('POST', '/api/pricelabs/refresh') },
+    pricing: () => api('GET', '/api/pricing'),
     dashboard: () => api('GET', '/api/dashboard'),
     mailingList: () => api('GET', '/api/mailing-list'),
     notifyGuest: (bookingId, body) => api('POST', `/api/bookings/${bookingId}/notify-guest`, body || {}),
@@ -140,7 +250,7 @@
 
   // ---------- router ----------
   const VIEWS = {};
-  const TOOL_VIEWS = new Set(['bulk', 'mailing', 'maintenance', 'cleanerCal', 'licensing', 'smsInbox']);
+  const TOOL_VIEWS = new Set(['pricing', 'requests', 'todos', 'guests', 'bulk', 'mailing', 'maintenance', 'cleanerCal', 'licensing', 'smsInbox', 'expenses', 'messaging', 'reviews', 'upsellCatalog', 'settings', 'cleaners']);
   function setView(name) {
     $$('.tab').forEach(b => {
       if (b.classList.contains('tools-toggle')) {
@@ -201,10 +311,17 @@
       const todoBadge = $('#todosBadge');
       if (overdueOrToday > 0) { todoBadge.textContent = overdueOrToday; todoBadge.classList.remove('hidden'); }
       else todoBadge.classList.add('hidden');
+
+      // Aggregate badge on the collapsed "More" menu so attention items aren't hidden.
+      const moreBadge = $('#moreBadge');
+      const moreTotal = pending + overdueOrToday;
+      if (moreBadge) {
+        if (moreTotal > 0) { moreBadge.textContent = moreTotal; moreBadge.classList.remove('hidden'); }
+        else moreBadge.classList.add('hidden');
+      }
     } catch (e) {}
   }
-  refreshBadges();
-  setInterval(refreshBadges, 30000);
+  // refreshBadges + interval are started by startApp() after a successful login.
 
   // ---------- DASHBOARD ----------
   VIEWS.dashboard = async (root) => {
@@ -214,16 +331,61 @@
       el('div', { class: 'muted' }, `All-time earnings: ${fmtMoney(d.all_time_earnings)} • ${d.all_time_bookings} bookings`)
     ));
 
+    const conflictKpi = el('div', { onclick: () => setView('calendar'), style: 'cursor:pointer;' },
+      kpi('Booking Conflicts', d.conflict_count || 0, d.conflict_count > 0 ? 'double-bookings — review now' : 'no overlaps', d.conflict_count > 0 ? 'danger' : 'success'));
+    const fin = d.financials || {};
+    const netKpi = el('div', { onclick: () => setView('financials'), style: 'cursor:pointer;' },
+      kpi('Net Profit (YTD)', fmtMoney(fin.net_profit || 0), `${((fin.margin || 0) * 100).toFixed(0)}% margin · ${fmtMoney(fin.total_expenses || 0)} costs`, 'success'));
+    const orphanKpi = el('div', { onclick: () => setView('calendar'), style: 'cursor:pointer;' },
+      kpi('Orphan Nights', d.orphan_nights || 0, d.orphan_count > 0 ? `${d.orphan_count} fillable gap(s)` : 'none', d.orphan_count > 0 ? 'warn' : null));
     root.appendChild(el('div', { class: 'kpi-grid' },
+      conflictKpi,
+      netKpi,
       kpi('YTD Earnings', fmtMoney(d.ytd_earnings), `${d.ytd_bookings} bookings`, 'success'),
+      el('div', { onclick: () => setView('financials'), style: 'cursor:pointer;' },
+        kpi('Tax Set-Aside', fmtMoney(fin.tax_setaside || 0), `${fin.tax_setaside_percent || 0}% of net`, 'warn')),
+      orphanKpi,
       kpi('YTD Nights Booked', d.ytd_nights, 'nights occupied YTD'),
       kpi('Avg / Booking (YTD)', fmtMoney(d.avg_per_booking_ytd), 'average revenue per booking'),
+      el('div', { onclick: () => setView('calendar'), style: 'cursor:pointer;' },
+        kpi('Reservations Needing Details', d.unconfirmed_reservations || 0, d.unconfirmed_reservations > 0 ? 'add amount/guest on the calendar' : 'all synced stays confirmed', d.unconfirmed_reservations > 0 ? 'warn' : null)),
       kpi('Upcoming Bookings', d.upcoming.length, d.upcoming[0] ? `Next: ${fmtDate(d.upcoming[0].check_in)}` : 'none'),
       kpi('Pending Requests', d.pending_requests || 0, 'from public booking page', d.pending_requests > 0 ? 'warn' : null),
       kpi('Open To-Dos', d.open_todo_count || 0, d.overdue_todo_count > 0 ? `${d.overdue_todo_count} overdue` : 'none overdue', d.overdue_todo_count > 0 ? 'warn' : null),
       kpi('Licensing', `${d.licensed_properties || 0}/${d.total_properties || 0}`, d.upcoming_renewals > 0 ? `${d.upcoming_renewals} renewal(s) in 90 days` : (d.pending_licensing_steps > 0 ? `${d.pending_licensing_steps} steps remaining` : 'all clear'), d.licensed_properties < d.total_properties ? 'warn' : 'success'),
       kpi('Out-of-stock items', d.low_stock_count, 'across all properties', d.low_stock_count > 0 ? 'warn' : null),
     ));
+
+    // Double-booking alert — the command center's #1 job.
+    if (d.conflicts && d.conflicts.length) {
+      const cCard = el('div', { class: 'card conflict-card' });
+      cCard.appendChild(el('div', { class: 'between' },
+        el('h2', null, '⚠️ Booking Conflicts (' + d.conflicts.length + ')'),
+        el('button', { class: 'btn-ghost small', onclick: () => setView('calendar') }, 'Open calendar →'),
+      ));
+      cCard.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-bottom:8px;' },
+        'Two guest reservations overlap at the same property. Resolve before they collide.'));
+      d.conflicts.forEach(c => {
+        const fmtSide = s => `${s.guest_name || (s.kind === 'reserved' ? 'Unconfirmed ' + (s.source || '') : 'Booking')} (${fmtDate(s.start)}→${fmtDate(s.end)}, ${s.source || ''})`;
+        cCard.appendChild(el('div', { class: 'conflict-row', style: 'padding:8px 0;border-top:1px solid #fee2e2;' },
+          el('strong', null, c.property_name || 'Property'),
+          el('div', { style: 'font-size:13px;' }, fmtSide(c.a) + '  ✕  ' + fmtSide(c.b)),
+          el('div', { class: 'muted', style: 'font-size:12px;' }, 'Overlap from ' + fmtDate(c.overlap_start)),
+        ));
+      });
+      root.appendChild(cCard);
+    }
+
+    // Orphan / gap-night opportunities
+    if (d.orphans && d.orphans.length) {
+      const oCard = el('div', { class: 'card', style: 'border-color:#fde68a;background:#fffbeb;' });
+      oCard.appendChild(el('div', { class: 'between' }, el('h2', null, '🔆 Fillable Gap Nights (' + d.orphans.length + ')'),
+        el('button', { class: 'btn-ghost small', onclick: () => setView('calendar') }, 'Open calendar →')));
+      oCard.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-bottom:8px;' }, 'Short empty gaps between bookings — drop the rate or set a min-stay to fill them before they\'re lost.'));
+      d.orphans.forEach(o => oCard.appendChild(el('div', { style: 'padding:6px 0;border-top:1px solid #fde68a;font-size:13px;' },
+        el('strong', null, o.property_name || 'Property'), ` — ${o.nights} night${o.nights > 1 ? 's' : ''}: ${fmtDate(o.gap_start)} → ${fmtDate(o.gap_end)}`)));
+      root.appendChild(oCard);
+    }
 
     // Unread SMS messages
     const smsMessages = await API.smsMessages.list();
@@ -520,9 +682,14 @@
 
   // ---------- CALENDAR ----------
   let calCursor = new Date();
+  let calHideSynced = false;
+  // 'agenda' (mobile-friendly list) or 'grid' (full month). Defaults by screen width, then remembered.
+  let calMode = localStorage.getItem('cal_mode') || (window.innerWidth <= 760 ? 'agenda' : 'grid');
   VIEWS.calendar = async (root) => {
-    const events = await API.calendar();
-    const props = await API.properties.list();
+    const [events, props, types, guests, bookings] = await Promise.all([
+      API.calendar(), API.properties.list(), API.bookingTypes.list(), API.guests.list(), API.bookings.list(),
+    ]);
+    const reRender = () => setView('calendar');
     const wrap = el('div', { class: 'cal-wrap' });
     const head = el('div', { class: 'cal-head' });
     const monthLbl = el('h2', null, calCursor.toLocaleDateString('en-CA', { year: 'numeric', month: 'long' }));
@@ -534,32 +701,59 @@
     const next = el('button', { class: 'btn-ghost', onclick: () => { calCursor.setMonth(calCursor.getMonth() + 1); setView('calendar'); } }, '→');
     const today = el('button', { class: 'btn-ghost', onclick: () => { calCursor = new Date(); setView('calendar'); } }, 'Today');
 
+    // Hide synced toggle
+    const hideSyncedLabel = el('label', { class: 'cal-hide-synced', style: 'display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap;' });
+    const hideSyncedCb = el('input', { type: 'checkbox', style: 'width:auto;margin:0;' });
+    hideSyncedCb.checked = calHideSynced;
+    hideSyncedCb.addEventListener('change', () => { calHideSynced = hideSyncedCb.checked; render(); });
+    hideSyncedLabel.appendChild(hideSyncedCb);
+    hideSyncedLabel.appendChild(document.createTextNode('Hide synced (Airbnb/VRBO)'));
+
+    const blockBtn = el('button', { class: 'btn-ghost', onclick: () => blockForm(null, props, reRender) }, '▦ Block dates');
+    // Mobile-friendly view toggle: Agenda (list) vs Month (grid)
+    const agendaBtn = el('button', { class: 'btn-ghost small', onclick: () => { calMode = 'agenda'; localStorage.setItem('cal_mode', 'agenda'); render(); } }, '☰ Agenda');
+    const gridBtn = el('button', { class: 'btn-ghost small', onclick: () => { calMode = 'grid'; localStorage.setItem('cal_mode', 'grid'); render(); } }, '▦ Month');
+    const modeToggle = el('div', { class: 'cal-mode-toggle' }, agendaBtn, gridBtn);
     head.appendChild(el('div', { class: 'btn-row' }, prev, today, next));
     head.appendChild(monthLbl);
-    head.appendChild(el('div', null, propFilter));
+    head.appendChild(el('div', { class: 'cal-head-controls', style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;' }, modeToggle, propFilter, hideSyncedLabel, blockBtn));
     wrap.appendChild(head);
-    const grid = el('div', { class: 'cal-grid' });
-    wrap.appendChild(grid);
+    const body = el('div', { class: 'cal-body' });
+    wrap.appendChild(body);
 
-    function inRange(start, end, day) {
-      const d = day.getTime();
-      const s = new Date(start).getTime();
-      const e = new Date(end || start).getTime();
-      return d >= s && d <= e;
+    // Helper: format date as local YYYY-MM-DD without timezone shift
+    function localIso(date) {
+      const y = date.getFullYear();
+      const m = String(date.getMonth() + 1).padStart(2, '0');
+      const d = String(date.getDate()).padStart(2, '0');
+      return y + '-' + m + '-' + d;
+    }
+    function inRange(start, end, dayIso) {
+      // Checkout day is NOT occupied (guest leaves that morning),
+      // so use < for end date. If no end date, show just the start day.
+      if (!end || end === start) return dayIso === start;
+      return dayIso >= start && dayIso < end;
     }
     function render() {
-      grid.innerHTML = '';
+      body.innerHTML = '';
+      agendaBtn.classList.toggle('active', calMode === 'agenda');
+      gridBtn.classList.toggle('active', calMode === 'grid');
       const propId = propFilter.value;
+      const todayStr = isoToday();
+      let filtered = events.filter(ev => !propId || String(ev.property_id) === propId);
+      if (calHideSynced) filtered = filtered.filter(ev => ev.kind !== 'synced');
+
+      if (calMode === 'agenda') { renderAgenda(body, filtered, todayStr); return; }
+
+      const grid = el('div', { class: 'cal-grid' });
+      body.appendChild(grid);
       ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(n => grid.appendChild(el('div', { class: 'cal-dayname' }, n)));
       const first = new Date(calCursor.getFullYear(), calCursor.getMonth(), 1);
       const startDayIdx = first.getDay();
       const daysInMonth = new Date(calCursor.getFullYear(), calCursor.getMonth() + 1, 0).getDate();
-      const todayStr = isoToday();
-      const filtered = events.filter(ev => !propId || String(ev.property_id) === propId);
-
       for (let i = 0; i < startDayIdx; i++) {
         const d = new Date(calCursor.getFullYear(), calCursor.getMonth(), -startDayIdx + i + 1);
-        grid.appendChild(dayCell(d, true, filtered));
+        grid.appendChild(dayCell(d, true, filtered, todayStr));
       }
       for (let day = 1; day <= daysInMonth; day++) {
         const d = new Date(calCursor.getFullYear(), calCursor.getMonth(), day);
@@ -568,28 +762,254 @@
       const trailing = (7 - ((startDayIdx + daysInMonth) % 7)) % 7;
       for (let i = 1; i <= trailing; i++) {
         const d = new Date(calCursor.getFullYear(), calCursor.getMonth() + 1, i);
-        grid.appendChild(dayCell(d, true, filtered));
+        grid.appendChild(dayCell(d, true, filtered, todayStr));
       }
     }
+    // Shared event-open behaviour (used by both grid cells and agenda rows).
+    function openEvent(ev) {
+      if (ev.kind === 'task') { API.todos.update(ev.todo_id, { status: ev.status === 'done' ? 'open' : 'done' }).then(reRender); return; }
+      if (ev.kind === 'block') { if (ev.manual && confirm('Remove this block (' + (ev.reason || 'Blocked') + ')?')) API.blocks.remove(ev.block_id).then(reRender); return; }
+      if (ev.kind === 'reserved') { claimSyncedForm(ev, props, types, guests, reRender); return; }
+      const full = bookings.find(b => b.id === ev.booking_id); if (full) bookingForm(full, props, types, guests, { onSaved: reRender });
+    }
+    // Mobile-friendly chronological list for the visible month.
+    function renderAgenda(container, filtered, todayStr) {
+      const y = calCursor.getFullYear(), mo = calCursor.getMonth();
+      const monthStart = localIso(new Date(y, mo, 1));
+      const monthEnd = localIso(new Date(y, mo + 1, 0));
+      const inMonth = filtered.filter(ev => { const s = ev.start, e = ev.end || ev.start; return s && s <= monthEnd && e >= monthStart; })
+        .sort((a, b) => (a.start || '').localeCompare(b.start || ''));
+      if (!inMonth.length) { container.appendChild(el('div', { class: 'empty', style: 'padding:24px;' }, 'Nothing scheduled this month.')); return; }
+      const groups = {};
+      inMonth.forEach(ev => { const key = ev.start < monthStart ? monthStart : ev.start; (groups[key] = groups[key] || []).push(ev); });
+      const order = { booking: 0, reserved: 1, block: 2, task: 3 };
+      const list = el('div', { class: 'cal-agenda' });
+      Object.keys(groups).sort().forEach(date => {
+        const dt = new Date(date + 'T00:00:00');
+        list.appendChild(el('div', { class: 'agenda-day' + (date === todayStr ? ' today' : '') },
+          el('span', { class: 'agenda-dow' }, dt.toLocaleDateString('en-CA', { weekday: 'short' })),
+          el('span', { class: 'agenda-date' }, fmtDate(date)),
+          date === todayStr ? el('span', { class: 'agenda-today-pill' }, 'Today') : null));
+        groups[date].sort((a, b) => (order[a.kind] || 9) - (order[b.kind] || 9)).forEach(ev => list.appendChild(agendaRow(ev, date)));
+      });
+      container.appendChild(list);
+    }
+    function agendaRow(ev, date) {
+      if (ev.kind === 'task') {
+        const done = ev.status === 'done';
+        return el('div', { class: 'agenda-row agenda-task' + (done ? ' done' : ''), onclick: () => openEvent(ev) },
+          el('span', { class: 'agenda-icon' }, done ? '✓' : '📋'),
+          el('div', { class: 'agenda-main' }, el('div', { class: 'agenda-title' }, ev.title), ev.property_name ? el('div', { class: 'agenda-sub' }, ev.property_name) : null));
+      }
+      if (ev.kind === 'block') {
+        return el('div', { class: 'agenda-row agenda-block', onclick: () => openEvent(ev) },
+          el('span', { class: 'agenda-icon' }, '▦'),
+          el('div', { class: 'agenda-main' }, el('div', { class: 'agenda-title' }, (ev.property_name || '') + ' — ' + (ev.manual ? (ev.reason || 'Blocked') : 'Blocked')),
+            el('div', { class: 'agenda-sub' }, fmtDate(ev.start) + ' → ' + fmtDate(ev.end))));
+      }
+      const cls = propColorClass(ev.property_name);
+      const guest = ev.guest_name || ev.contact_name || (ev.kind === 'reserved' ? 'Reserved' : 'Booking');
+      const needs = ev.kind === 'reserved';
+      const verified = ev.kind === 'booking' && ev.platform_verified;
+      const isCheckin = ev.start === date;
+      const nights = (ev.start && ev.end && ev.end > ev.start) ? Math.round((new Date(ev.end) - new Date(ev.start)) / 86400000) : 1;
+      return el('div', { class: 'agenda-row ' + cls + (needs ? ' reserved' : ''), onclick: () => openEvent(ev) },
+        el('span', { class: 'agenda-chip ' + cls }, ev.property_name || ''),
+        el('div', { class: 'agenda-main' },
+          el('div', { class: 'agenda-title' }, (verified ? '🔒 ' : '') + guest),
+          el('div', { class: 'agenda-sub' }, fmtDate(ev.start) + ' → ' + fmtDate(ev.end) + ' · ' + nights + 'n' + (ev.amount ? ' · ' + fmtMoney(ev.amount) : (needs ? ' · amount needed' : '')) + (ev.source ? ' · ' + ev.source : ''))),
+        isCheckin && !needs ? el('span', { class: 'checkin-pill' }, 'Check-In') : (needs ? el('span', { class: 'needs-pill' }, '＋ details') : null));
+    }
+    function propColorClass(name) {
+      const s = slug(name || '');
+      if (s.indexOf('escape') !== -1) return 'prop-escape';
+      if (s.indexOf('retreat') !== -1) return 'prop-retreat';
+      if (s.indexOf('hideaway') !== -1) return 'prop-hideaway';
+      return 'prop-other';
+    }
     function dayCell(date, isOther, evs, todayStr) {
-      const iso = date.toISOString().slice(0, 10);
+      const iso = localIso(date);
       const cell = el('div', { class: 'cal-day' + (isOther ? ' other' : '') + (iso === todayStr ? ' today' : '') },
         el('div', { class: 'dnum' }, String(date.getDate())));
-      evs.forEach(ev => {
-        if (!inRange(ev.start, ev.end, date)) return;
-        const cls = ev.kind === 'synced' ? slug(ev.source) || 'synced' : slug(ev.source) || 'manual';
-        const title = `${ev.title}${ev.amount ? ' • ' + fmtMoney(ev.amount) : ''}`;
-        cell.appendChild(el('span', { class: 'cal-event ' + cls, title }, ev.kind === 'synced' ? '🔒 ' + (ev.property_name || '') : (ev.property_name || '')));
+      // Quick-add a task on this day
+      if (!isOther) {
+        cell.appendChild(el('button', { class: 'cal-add-task', title: 'Add a task on this day',
+          onclick: (e) => { e.stopPropagation(); quickTaskForm(iso, props, reRender); } }, '+'));
+      }
+      const dayEvs = evs.filter(ev => inRange(ev.start, ev.end, iso));
+
+      // Conflict = 2+ guest entries (booking or unclaimed reservation) at one property today.
+      const guestByProp = {};
+      dayEvs.forEach(ev => {
+        if (ev.kind !== 'booking' && ev.kind !== 'reserved') return;
+        (guestByProp[ev.property_id] = guestByProp[ev.property_id] || []).push(ev);
       });
+      const conflictProps = new Set();
+      for (const pid of Object.keys(guestByProp)) {
+        if (guestByProp[pid].length > 1) conflictProps.add(Number(pid));
+      }
+      if (conflictProps.size > 0) {
+        cell.classList.add('cal-conflict');
+        cell.querySelector('.dnum').appendChild(
+          el('span', { class: 'cal-conflict-badge', title: 'Double-booking — two guest reservations at the same property on this date' }, '!'));
+      }
+
+      // Order: guest stays first, then blocks, then tasks.
+      const order = { booking: 0, reserved: 1, block: 2, task: 3 };
+      const sorted = dayEvs.slice().sort((a, b) => (order[a.kind] || 9) - (order[b.kind] || 9));
+
+      sorted.forEach(ev => {
+        const isFirst = iso === ev.start;
+
+        if (ev.kind === 'task') {
+          const done = ev.status === 'done';
+          cell.appendChild(el('div', {
+            class: 'cal-event cal-task' + (done ? ' done' : ''),
+            title: 'Task: ' + ev.title + (ev.property_name ? ' • ' + ev.property_name : '') + ' — click to toggle done',
+            onclick: async (e) => { e.stopPropagation(); await API.todos.update(ev.todo_id, { status: done ? 'open' : 'done' }); reRender(); },
+          }, el('span', { class: 'cal-task-icon' }, done ? '✓' : '📋'), el('span', { class: 'cal-ev-title' }, ev.title)));
+          return;
+        }
+
+        if (ev.kind === 'block') {
+          const manual = ev.manual;
+          cell.appendChild(el('div', {
+            class: 'cal-event cal-block' + (manual ? ' manual' : ''),
+            title: (ev.property_name || '') + ' — ' + (manual ? (ev.reason || 'Blocked') + ' (manual — click to remove)' : 'Blocked / not available (' + ev.source + ')'),
+            onclick: manual ? async (e) => {
+              e.stopPropagation();
+              if (!confirm('Remove this block (' + (ev.reason || 'Blocked') + ')?')) return;
+              await API.blocks.remove(ev.block_id); reRender();
+            } : null,
+          }, '▦ ' + (manual ? (ev.reason || 'Blocked') : 'Blocked')));
+          return;
+        }
+
+        // booking or reserved (guest stay)
+        const cls = propColorClass(ev.property_name);
+        const isConflict = conflictProps.has(ev.property_id);
+        const guest = ev.guest_name || ev.contact_name || (ev.kind === 'reserved' ? 'Reserved' : 'Booking');
+        const verified = ev.kind === 'booking' && ev.platform_verified;
+        const needs = ev.kind === 'reserved';
+        const amountTxt = ev.amount ? ' • ' + fmtMoney(ev.amount) : (needs ? ' • amount needed' : '');
+        const srcTxt = verified ? ' • ✓ verified on ' + ev.synced_source : (ev.source ? ' • ' + ev.source : '');
+        const span = el('div', {
+          class: 'cal-event ' + cls + (needs ? ' reserved' : '') + (isConflict ? ' conflict' : ''),
+          title: `${ev.property_name || ''} — ${guest}${amountTxt}${srcTxt}`,
+          onclick: (e) => {
+            e.stopPropagation();
+            if (needs) { claimSyncedForm(ev, props, types, guests, reRender); }
+            else { const full = bookings.find(b => b.id === ev.booking_id); if (full) bookingForm(full, props, types, guests, { onSaved: reRender }); }
+          },
+        });
+        span.appendChild(el('span', { class: 'cal-ev-prop' }, (verified ? '🔒 ' : '') + (ev.property_name || '')));
+        span.appendChild(el('span', { class: 'cal-ev-guest' }, guest));
+        if (isFirst) span.appendChild(el('span', { class: 'checkin-pill' }, 'Check-In'));
+        if (needs) span.appendChild(el('span', { class: 'needs-pill' }, '＋ Add details'));
+        cell.appendChild(span);
+      });
+
+      // Check-out markers (guest leaving the morning of this day).
+      evs.filter(ev => (ev.kind === 'booking' || ev.kind === 'reserved') && ev.end === iso && ev.end !== ev.start)
+        .forEach(ev => cell.appendChild(el('div', { class: 'cal-checkout',
+          title: 'Check-out: ' + (ev.guest_name || ev.contact_name || '') }, '⤴ Check-out: ' + (ev.guest_name || ev.contact_name || ''))));
+
       return cell;
     }
     render();
     root.appendChild(el('div', { class: 'between' },
       el('h1', null, 'Calendar'),
-      el('div', { class: 'muted' }, '🔒 = synced from Airbnb/VRBO (read-only)')
+      el('div', { class: 'cal-legend', style: 'display:flex;align-items:center;gap:12px;font-size:12px;flex-wrap:wrap;' },
+        el('span', { class: 'cal-event prop-escape', style: 'display:inline-block;padding:2px 8px;' }, 'Escape'),
+        el('span', { class: 'cal-event prop-retreat', style: 'display:inline-block;padding:2px 8px;' }, 'Retreat'),
+        el('span', { class: 'cal-event prop-hideaway', style: 'display:inline-block;padding:2px 8px;' }, 'Hideaway'),
+        el('span', { style: 'color:#64748b;' }, '🔒 = verified on Airbnb/VRBO'),
+        el('span', { style: 'color:#b45309;font-weight:600;' }, '＋ Add details = needs amount/guest'),
+        el('span', { style: 'color:#64748b;' }, '▦ = blocked'),
+        el('span', { style: 'color:#64748b;' }, '📋 = task'),
+        el('span', { style: 'color:#dc2626;font-weight:600;' }, '! = double-booking')
+      )
     ));
     root.appendChild(wrap);
   };
+
+  // Claim/enrich an unconfirmed Airbnb/VRBO reservation → creates a linked booking.
+  function claimSyncedForm(ev, props, types, guests, onSaved) {
+    const form = el('form', { class: 'form-grid' });
+    const guestOpts = [{ value: '', label: '— new guest below —' }].concat(guests.map(g => ({ value: String(g.id), label: g.name + (g.email ? ` <${g.email}>` : '') })));
+    const propName = (props.find(p => p.id === ev.property_id) || {}).nickname || ev.property_name || '';
+    form.appendChild(el('div', { class: 'muted', style: 'grid-column:1/-1;font-size:13px;margin-bottom:4px;' },
+      `${(ev.source || '').toUpperCase()} reservation • ${propName} • ${fmtDate(ev.start)} → ${fmtDate(ev.end)}`));
+    form.appendChild(formField('Amount', input('amount', { type: 'number', step: '0.01', placeholder: 'e.g. 975.00' })));
+    form.appendChild(formField('Existing guest', select('guest_id', guestOpts, '')));
+    form.appendChild(formField('+ New guest name', input('new_guest_name', { value: ev.guest_name || '', placeholder: 'guest name' })));
+    form.appendChild(formField('+ New guest email', input('new_guest_email', { type: 'email' })));
+    form.appendChild(formField('+ New guest phone', input('new_guest_phone')));
+    form.appendChild(formField('Check-in', input('check_in', { type: 'date', value: ev.start })));
+    form.appendChild(formField('Check-out', input('check_out', { type: 'date', value: ev.end })));
+    form.appendChild(formField('Notes', textarea('notes', ''), { full: true }));
+    form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, 'Save booking details'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const d = readForm(form);
+      const payload = { amount: Number(d.amount) || 0, check_in: d.check_in, check_out: d.check_out || null, notes: d.notes };
+      if (d.guest_id) payload.guest_id = Number(d.guest_id);
+      else if (d.new_guest_name) { payload.new_guest = { name: d.new_guest_name, email: d.new_guest_email, phone: d.new_guest_phone }; payload.guest_name = d.new_guest_name; }
+      else if (ev.guest_name) payload.guest_name = ev.guest_name;
+      try { await API.claimSynced(ev.synced_event_id, payload); toast('Booking details saved', 'success'); closeModal(); onSaved && onSaved(); } catch (e) {}
+    });
+    openModal('Add booking details', form);
+  }
+
+  // Manually block dates (owner stay, maintenance, etc.) — shows grey on the calendar.
+  function blockForm(preset, props, onSaved) {
+    const form = el('form', { class: 'form-grid' });
+    const propOpts = props.map(p => ({ value: String(p.id), label: p.nickname }));
+    form.appendChild(formField('Property *', select('property_id', propOpts, preset?.property_id)));
+    form.appendChild(formField('Reason', input('reason', { value: preset?.reason || '', placeholder: 'e.g. Owner stay, Maintenance' })));
+    form.appendChild(formField('From *', input('start_date', { type: 'date', value: preset?.start_date || isoToday(), required: true })));
+    form.appendChild(formField('To (checkout)', input('end_date', { type: 'date', value: preset?.end_date || '' })));
+    form.appendChild(el('div', { class: 'muted', style: 'grid-column:1/-1;font-size:12px;' },
+      'Blocked dates show in grey so these nights never get double-booked. "To" is the checkout morning (that night is free).'));
+    form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, 'Block dates'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const d = readForm(form);
+      if (!d.property_id || !d.start_date) { toast('Property and start date required', 'error'); return; }
+      try {
+        await API.blocks.create({ property_id: Number(d.property_id), start_date: d.start_date, end_date: d.end_date || null, reason: d.reason });
+        toast('Dates blocked', 'success'); closeModal(); onSaved && onSaved();
+      } catch (e) {}
+    });
+    openModal('Block dates', form);
+  }
+
+  // Quick-add a calendar task (e.g. "Assemble beds", "Refill inventory") from a day cell.
+  function quickTaskForm(dateIso, props, onSaved) {
+    const form = el('form', { class: 'form-grid' });
+    const propOpts = [{ value: '', label: '— none —' }].concat(props.map(p => ({ value: String(p.id), label: p.nickname })));
+    form.appendChild(formField('Task *', input('title', { placeholder: 'e.g. Assemble beds, refill inventory', required: true })));
+    form.appendChild(formField('Property', select('property_id', propOpts, '')));
+    form.appendChild(formField('Due date', input('due_date', { type: 'date', value: dateIso })));
+    form.appendChild(formField('Priority', select('priority', [{ value: 'high', label: 'High' }, { value: 'medium', label: 'Medium' }, { value: 'low', label: 'Low' }], 'medium')));
+    form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, 'Add task'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const d = readForm(form);
+      if (!d.title) return;
+      try {
+        await API.todos.create({ title: d.title, property_id: d.property_id || null, due_date: d.due_date || null, priority: d.priority });
+        toast('Task added', 'success'); closeModal(); onSaved && onSaved();
+      } catch (e) {}
+    });
+    openModal('Add calendar task', form);
+  }
 
   // ---------- TO-DO TASKS ----------
   function renderTodoRow(t, onToggle) {
@@ -841,7 +1261,8 @@
     render();
   };
 
-  function bookingForm(b, props, types, guests) {
+  function bookingForm(b, props, types, guests, opts) {
+    const onSaved = (opts && opts.onSaved) || (() => setView('bookings'));
     const form = el('form', { class: 'form-grid' });
     const propOpts = props.map(p => ({ value: String(p.id), label: p.nickname }));
     const typeOpts = [{ value: '', label: '— none —' }].concat(types.map(t => ({ value: String(t.id), label: t.name })));
@@ -857,11 +1278,38 @@
     form.appendChild(formField('+ New guest name', input('new_guest_name', { value: '', placeholder: 'optional' })));
     form.appendChild(formField('+ New guest email', input('new_guest_email', { type: 'email' })));
     form.appendChild(formField('+ New guest phone', input('new_guest_phone')));
+    form.appendChild(formField('Door code', input('door_code', { value: b?.door_code, placeholder: 'sent in pre-arrival message' })));
     form.appendChild(formField('Notes', textarea('notes', b?.notes), { full: true }));
+    let cancelCb = null;
+    if (b) {
+      cancelCb = el('input', { type: 'checkbox', style: 'width:auto;' }); cancelCb.checked = b.status === 'cancelled';
+      form.appendChild(el('label', { style: 'grid-column:1/-1;display:flex;gap:8px;align-items:center;' }, cancelCb, 'Cancelled (frees the calendar, excluded from revenue)'));
+    }
     form.appendChild(el('div', { class: 'btn-row', style: 'grid-column: 1/-1; margin-top: 8px;' },
       el('button', { class: 'btn-primary', type: 'submit' }, b ? 'Save changes' : 'Create booking'),
       el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel'),
     ));
+    // Upsells / add-ons (existing bookings only — needs a booking id)
+    if (b) {
+      const upWrap = el('div', { style: 'grid-column:1/-1;border-top:1px solid var(--border);margin-top:10px;padding-top:10px;' },
+        el('strong', null, 'Add-ons / upsells'), el('div', { class: 'muted', style: 'font-size:12px;margin-bottom:6px;' }, 'Firewood, early check-in, pet fee… counts as ancillary revenue.'));
+      const list = el('div'); upWrap.appendChild(list);
+      const renderUps = async () => {
+        list.innerHTML = '';
+        const [items, catalog] = await Promise.all([API.bookingUpsells.list(b.id), API.upsells.list()]);
+        items.forEach(u => list.appendChild(el('div', { style: 'display:flex;gap:8px;align-items:center;padding:2px 0;' },
+          el('span', { style: 'flex:1;' }, `${u.name} ×${u.qty || 1}`), el('span', null, fmtMoney((u.price || 0) * (u.qty || 1))),
+          el('button', { class: 'btn-danger', type: 'button', onclick: async () => { await API.bookingUpsells.remove(u.id); renderUps(); } }, '×'))));
+        const catSel = select('add_upsell', [{ value: '', label: '+ add add-on…' }].concat(catalog.filter(c => c.active).map(c => ({ value: c.id + '|' + c.name + '|' + c.default_price, label: `${c.name} (${fmtMoney(c.default_price)})` }))), '');
+        catSel.style.width = 'auto';
+        catSel.addEventListener('change', async () => {
+          if (!catSel.value) return; const [, name, price] = catSel.value.split('|');
+          await API.bookingUpsells.create({ booking_id: b.id, name, price: Number(price) || 0, qty: 1 }); renderUps();
+        });
+        list.appendChild(el('div', { style: 'margin-top:6px;' }, catSel));
+      };
+      form.appendChild(upWrap); renderUps();
+    }
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const d = readForm(form);
@@ -871,13 +1319,15 @@
         guest_id: d.guest_id ? Number(d.guest_id) : null,
         check_in: d.check_in, check_out: d.check_out || null,
         amount: Number(d.amount) || 0, contact_name: d.contact_name, notes: d.notes,
+        door_code: d.door_code || '',
       };
+      if (cancelCb) payload.status = cancelCb.checked ? 'cancelled' : 'confirmed';
       if (!payload.guest_id && d.new_guest_name) {
         payload.new_guest = { name: d.new_guest_name, email: d.new_guest_email, phone: d.new_guest_phone };
       }
       try {
         if (b) await API.bookings.update(b.id, payload); else await API.bookings.create(payload);
-        toast('Saved', 'success'); closeModal(); setView('bookings');
+        toast('Saved', 'success'); closeModal(); onSaved();
       } catch (e) {}
     });
     openModal(b ? 'Edit booking' : 'New booking', form);
@@ -1633,16 +2083,16 @@ Matt`;
             item.attachments.forEach(att => {
               var isImage = /^image\//i.test(att.mime_type);
               var fileRow = el('div', { class: 'lic-file-row' });
-              if (isImage) {
-                fileRow.appendChild(el('img', { class: 'lic-file-thumb', src: '/uploads/' + att.filename, alt: att.original_name }));
+              if (isImage && att.url) {
+                fileRow.appendChild(el('img', { class: 'lic-file-thumb', src: att.url, alt: att.original_name }));
               } else {
                 fileRow.appendChild(el('span', { class: 'lic-file-icon' }, '📄'));
               }
-              fileRow.appendChild(el('a', { class: 'lic-file-name', href: '/uploads/' + att.filename, target: '_blank' }, att.original_name));
+              fileRow.appendChild(el('a', { class: 'lic-file-name', href: att.url || '#', target: '_blank' }, att.original_name));
               fileRow.appendChild(el('span', { class: 'muted', style: 'font-size:11px;' }, (att.size / 1024).toFixed(0) + ' KB'));
               fileRow.appendChild(el('button', { class: 'btn-danger small', title: 'Remove', onclick: async () => {
                 if (!confirm('Remove this file?')) return;
-                await API.licensing.deleteFile(item.id, att.filename);
+                await API.licensing.deleteFile(item.id, att.path);
                 renderProp(propId);
               }}, '×'));
               fileList.appendChild(fileRow);
@@ -1888,6 +2338,417 @@ Matt`;
     root.appendChild(card);
   };
 
-  // ---------- BOOT ----------
-  setView('dashboard');
+  // ========================================================
+  // PROFIT & AUTOMATION VIEWS (Phases C–H)
+  // ========================================================
+  const EXPENSE_CATEGORIES = ['Cleaning', 'Supplies', 'Utilities', 'Mortgage/Interest', 'Property Tax', 'Maintenance', 'Repairs', 'Insurance', 'Licensing', 'Internet/Cable', 'Platform Fees', 'Furnishings', 'Marketing', 'Other'];
+  let financialsYear = new Date().getFullYear();
+
+  function simpleTable(headers, rows) {
+    const tbl = el('table');
+    tbl.appendChild(el('thead', null, el('tr', null, ...headers.map(h => el('th', h.num ? { class: 'num' } : null, h.label || h)))));
+    const tb = el('tbody');
+    rows.forEach(r => tb.appendChild(el('tr', null, ...r.map((c, i) => el('td', headers[i] && headers[i].num ? { class: 'num' } : null, c)))));
+    tbl.appendChild(tb);
+    return tbl;
+  }
+  function downloadCsv(filename, headerArr, rows) {
+    const esc = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+    const csv = [headerArr.map(esc).join(',')].concat(rows.map(r => r.map(esc).join(','))).join('\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+    const a = el('a', { href: url, download: filename }); document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  }
+
+  // ---------- MONEY / FINANCIALS ----------
+  VIEWS.financials = async (root) => {
+    const [f, props, types] = await Promise.all([API.financials(financialsYear), API.properties.list(), API.bookingTypes.list()]);
+    const m = f.metrics || {};
+    const yearSel = select('fy', (() => { const o = []; const cy = new Date().getFullYear(); for (let y = cy + 1; y >= cy - 4; y--) o.push({ value: String(y), label: String(y) }); return o; })(), String(financialsYear));
+    yearSel.style.width = 'auto';
+    yearSel.addEventListener('change', () => { financialsYear = Number(yearSel.value); setView('financials'); });
+    root.appendChild(el('div', { class: 'between' },
+      el('h1', null, 'Money'),
+      el('div', { style: 'display:flex;gap:8px;align-items:center;' }, el('span', { class: 'muted' }, 'Year'), yearSel,
+        el('button', { class: 'btn-ghost', onclick: () => exportPnl(f) }, '⬇ Export P&L'))));
+
+    root.appendChild(el('div', { class: 'kpi-grid' },
+      kpi('Net Profit', fmtMoney(f.net_profit), `${(f.margin * 100).toFixed(1)}% margin`, f.net_profit >= 0 ? 'success' : 'danger'),
+      kpi('Total Revenue', fmtMoney(f.total_revenue), `incl. ${fmtMoney(f.ancillary_revenue)} add-ons`),
+      kpi('Platform Fees', fmtMoney(f.platform_fees), 'paid to channels', f.platform_fees > 0 ? 'warn' : null),
+      kpi('Expenses', fmtMoney(f.total_expenses), 'tracked costs', f.total_expenses > 0 ? 'warn' : null),
+      kpi('Tax Set-Aside', fmtMoney(f.tax_setaside), `${f.tax_setaside_percent}% of net`, 'warn'),
+      kpi('Ancillary Revenue', fmtMoney(f.ancillary_revenue), 'upsells / add-ons'),
+    ));
+
+    // Net profit by property
+    const pcard = el('div', { class: 'card' });
+    pcard.appendChild(el('h2', null, 'Net Profit by Property'));
+    pcard.appendChild(simpleTable(
+      ['Property', { label: 'Revenue', num: true }, { label: 'Fees', num: true }, { label: 'Expenses', num: true }, { label: 'Net Profit', num: true }, { label: 'Margin', num: true }],
+      f.by_property.map(p => [p.nickname, fmtMoney(p.revenue), fmtMoney(p.fees), fmtMoney(p.expenses), fmtMoney(p.net_profit), (p.margin * 100).toFixed(0) + '%'])));
+    root.appendChild(pcard);
+
+    // By channel (effective rate) + editable fees
+    const ccard = el('div', { class: 'card' });
+    ccard.appendChild(el('div', { class: 'between' }, el('h2', null, 'By Channel (after fees)'),
+      el('button', { class: 'btn-ghost small', onclick: () => editChannelFees(types) }, 'Edit channel fees')));
+    ccard.appendChild(simpleTable(
+      ['Channel', { label: 'Fee %', num: true }, { label: 'Bookings', num: true }, { label: 'Revenue', num: true }, { label: 'Fees', num: true }, { label: 'Net', num: true }, { label: 'Effective', num: true }],
+      f.by_channel.map(c => [c.type + (c.is_direct ? ' ✦' : ''), c.fee_percent + '%', c.bookings, fmtMoney(c.revenue), fmtMoney(c.fees), fmtMoney(c.net), (c.effective_rate * 100).toFixed(0) + '%'])));
+    ccard.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-top:6px;' }, '✦ = direct booking (no platform fee)'));
+    root.appendChild(ccard);
+
+    // Expense categories
+    if (f.expense_categories.length) {
+      const ecard = el('div', { class: 'card' });
+      ecard.appendChild(el('div', { class: 'between' }, el('h2', null, 'Expenses by Category'),
+        el('button', { class: 'btn-ghost small', onclick: () => setView('expenses') }, 'Manage expenses →')));
+      ecard.appendChild(simpleTable(['Category', { label: 'Amount', num: true }], f.expense_categories.map(c => [c.category, fmtMoney(c.amount)])));
+      root.appendChild(ecard);
+    } else {
+      root.appendChild(el('div', { class: 'card empty' },
+        el('div', null, 'No expenses tracked yet — your "net profit" is just revenue minus fees. '),
+        el('button', { class: 'btn-primary', style: 'margin-top:8px;', onclick: () => setView('expenses') }, 'Add expenses to see true profit')));
+    }
+
+    // P&L by month
+    const pnlCard = el('div', { class: 'card' });
+    pnlCard.appendChild(el('h2', null, `Monthly P&L — ${f.year}`));
+    pnlCard.appendChild(simpleTable(
+      ['Month', { label: 'Revenue', num: true }, { label: 'Fees', num: true }, { label: 'Expenses', num: true }, { label: 'Net', num: true }],
+      f.pnl_by_month.filter(r => r.revenue || r.expenses).map(r => [r.label, fmtMoney(r.revenue), fmtMoney(r.fees), fmtMoney(r.expenses), fmtMoney(r.net)])));
+    root.appendChild(pnlCard);
+
+    // Performance metrics
+    const mcard = el('div', { class: 'card' });
+    mcard.appendChild(el('h2', null, 'Performance Metrics'));
+    mcard.appendChild(el('div', { class: 'kpi-grid' },
+      kpi('Direct Booking %', (m.direct_booking_pct * 100).toFixed(0) + '%', 'fee-free bookings'),
+      kpi('Repeat Guest %', (m.repeat_guest_rate * 100).toFixed(0) + '%', 'guests who rebooked'),
+      kpi('Avg Lead Time', m.avg_lead_time_days + ' days', 'booking → check-in'),
+      kpi('Avg Length of Stay', m.avg_length_of_stay + ' nights', ''),
+      kpi('Cancellation Rate', (m.cancellation_rate * 100).toFixed(0) + '%', '', m.cancellation_rate > 0.1 ? 'warn' : null),
+      kpi('Reviews', m.review_count ? m.avg_rating + '★' : '—', `${m.review_count} reviews`),
+      kpi('Cost / Turnover', fmtMoney(m.cost_per_turnover), 'cleaning ÷ stays'),
+      kpi('YoY Revenue', m.yoy_revenue_change == null ? '—' : (m.yoy_revenue_change > 0 ? '+' : '') + (m.yoy_revenue_change * 100).toFixed(0) + '%', `vs ${f.year - 1}`, m.yoy_revenue_change >= 0 ? 'success' : 'danger'),
+    ));
+    root.appendChild(mcard);
+
+    function exportPnl(f) {
+      downloadCsv(`pnl-${f.year}.csv`, ['Month', 'Revenue', 'Fees', 'Expenses', 'Net'],
+        f.pnl_by_month.map(r => [r.label, r.revenue, r.fees, r.expenses, r.net]));
+    }
+  };
+
+  function editChannelFees(types) {
+    const form = el('form', { class: 'form-grid' });
+    const inputs = types.map(t => {
+      const fee = input('fee_' + t.id, { type: 'number', step: '0.1', value: t.fee_percent == null ? 0 : t.fee_percent });
+      const direct = el('input', { type: 'checkbox', name: 'direct_' + t.id, style: 'width:auto;' }); direct.checked = !!t.is_direct;
+      form.appendChild(el('div', { style: 'grid-column:1/-1;display:flex;gap:10px;align-items:center;' },
+        el('strong', { style: 'width:130px;' }, t.name), el('span', { class: 'muted' }, 'fee %'), fee,
+        el('label', { style: 'display:flex;gap:4px;align-items:center;' }, direct, 'direct booking')));
+      return { t, fee, direct };
+    });
+    form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, 'Save fees'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      for (const { t, fee, direct } of inputs) await API.bookingTypeUpdate(t.id, { fee_percent: Number(fee.value) || 0, is_direct: direct.checked ? 1 : 0 });
+      toast('Channel fees saved', 'success'); closeModal(); setView('financials');
+    });
+    openModal('Channel fees', form);
+  }
+
+  // ---------- EXPENSES ----------
+  VIEWS.expenses = async (root) => {
+    const [expenses, props] = await Promise.all([API.expenses.list(), API.properties.list()]);
+    root.appendChild(el('div', { class: 'between' }, el('h1', null, 'Expenses'),
+      el('button', { class: 'btn-primary', onclick: () => expenseForm(null, props) }, '+ Add expense')));
+    const total = expenses.reduce((a, e) => a + (e.amount || 0), 0);
+    root.appendChild(el('div', { class: 'kpi-grid' },
+      kpi('Total Expenses', fmtMoney(total), `${expenses.length} entries`, total > 0 ? 'warn' : null)));
+    const card = el('div', { class: 'card' });
+    if (!expenses.length) card.appendChild(el('div', { class: 'empty' }, 'No expenses yet. Track cleaning, supplies, utilities, fees, etc. to see true net profit on the Money tab.'));
+    else {
+      const tbl = el('table');
+      tbl.appendChild(el('thead', null, el('tr', null, el('th', null, 'Date'), el('th', null, 'Category'), el('th', null, 'Property'), el('th', null, 'Vendor'), el('th', { class: 'num' }, 'Amount'), el('th', null, ''))));
+      const tb = el('tbody');
+      expenses.forEach(e => tb.appendChild(el('tr', null,
+        el('td', null, fmtDate(e.date)), el('td', null, e.category || ''), el('td', null, e.property_name || '—'),
+        el('td', null, e.vendor || ''), el('td', { class: 'num' }, fmtMoney(e.amount)),
+        el('td', null, el('div', { class: 'btn-row' },
+          el('button', { class: 'btn-ghost', onclick: () => expenseForm(e, props) }, 'Edit'),
+          el('button', { class: 'btn-danger', onclick: async () => { if (confirm('Delete expense?')) { await API.expenses.remove(e.id); setView('expenses'); } } }, 'Delete'))))));
+      tbl.appendChild(tb); card.appendChild(tbl);
+    }
+    root.appendChild(card);
+  };
+  function expenseForm(e, props) {
+    const form = el('form', { class: 'form-grid' });
+    form.appendChild(formField('Amount *', input('amount', { type: 'number', step: '0.01', value: e?.amount, required: true })));
+    form.appendChild(formField('Date', input('date', { type: 'date', value: e?.date || isoToday() })));
+    form.appendChild(formField('Category', select('category', EXPENSE_CATEGORIES.map(c => ({ value: c, label: c })), e?.category || 'Cleaning')));
+    form.appendChild(formField('Property', select('property_id', [{ value: '', label: '— all / general —' }].concat(props.map(p => ({ value: String(p.id), label: p.nickname }))), e?.property_id || '')));
+    form.appendChild(formField('Vendor', input('vendor', { value: e?.vendor })));
+    form.appendChild(formField('Notes', textarea('notes', e?.notes), { full: true }));
+    form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, e ? 'Save' : 'Add expense'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault(); const d = readForm(form);
+      const payload = { amount: Number(d.amount) || 0, date: d.date, category: d.category, property_id: d.property_id || null, vendor: d.vendor, notes: d.notes };
+      try { if (e) await API.expenses.update(e.id, payload); else await API.expenses.create(payload); toast('Saved', 'success'); closeModal(); setView('expenses'); } catch (err) {}
+    });
+    openModal(e ? 'Edit expense' : 'Add expense', form);
+  }
+
+  // ---------- UPSELL CATALOG ----------
+  VIEWS.upsellCatalog = async (root) => {
+    const upsells = await API.upsells.list();
+    root.appendChild(el('div', { class: 'between' }, el('h1', null, 'Upsell Catalog'),
+      el('button', { class: 'btn-primary', onclick: () => upsellForm(null) }, '+ Add upsell')));
+    root.appendChild(el('div', { class: 'muted', style: 'margin-bottom:12px;' }, 'Add-ons you can attach to bookings (firewood, early check-in, pet fee…). These power your ancillary-revenue metric.'));
+    const card = el('div', { class: 'card' });
+    const tbl = el('table');
+    tbl.appendChild(el('thead', null, el('tr', null, el('th', null, 'Upsell'), el('th', { class: 'num' }, 'Default price'), el('th', null, 'Active'), el('th', null, ''))));
+    const tb = el('tbody');
+    upsells.forEach(u => tb.appendChild(el('tr', null,
+      el('td', null, u.name), el('td', { class: 'num' }, fmtMoney(u.default_price)), el('td', null, u.active ? 'Yes' : 'No'),
+      el('td', null, el('div', { class: 'btn-row' },
+        el('button', { class: 'btn-ghost', onclick: () => upsellForm(u) }, 'Edit'),
+        el('button', { class: 'btn-danger', onclick: async () => { if (confirm('Delete upsell?')) { await API.upsells.remove(u.id); setView('upsellCatalog'); } } }, 'Delete'))))));
+    tbl.appendChild(tb); card.appendChild(tbl); root.appendChild(card);
+  };
+  function upsellForm(u) {
+    const form = el('form', { class: 'form-grid' });
+    form.appendChild(formField('Name *', input('name', { value: u?.name, required: true })));
+    form.appendChild(formField('Default price', input('default_price', { type: 'number', step: '0.01', value: u?.default_price })));
+    form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, 'Save'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault(); const d = readForm(form);
+      try { if (u) await API.upsells.update(u.id, { name: d.name, default_price: Number(d.default_price) || 0 }); else await API.upsells.create({ name: d.name, default_price: Number(d.default_price) || 0 }); toast('Saved', 'success'); closeModal(); setView('upsellCatalog'); } catch (err) {}
+    });
+    openModal(u ? 'Edit upsell' : 'Add upsell', form);
+  }
+
+  // ---------- REVIEWS ----------
+  VIEWS.reviews = async (root) => {
+    const [reviews, props] = await Promise.all([API.reviews.list(), API.properties.list()]);
+    root.appendChild(el('div', { class: 'between' }, el('h1', null, 'Reviews'),
+      el('button', { class: 'btn-primary', onclick: () => reviewForm(null, props) }, '+ Add review')));
+    const avg = reviews.length ? (reviews.reduce((a, r) => a + (Number(r.rating) || 0), 0) / reviews.length).toFixed(2) : '—';
+    root.appendChild(el('div', { class: 'kpi-grid' }, kpi('Average Rating', avg + (reviews.length ? '★' : ''), `${reviews.length} reviews`, 'success')));
+    const card = el('div', { class: 'card' });
+    if (!reviews.length) card.appendChild(el('div', { class: 'empty' }, 'No reviews logged yet.'));
+    else {
+      const tbl = el('table');
+      tbl.appendChild(el('thead', null, el('tr', null, el('th', null, 'Date'), el('th', null, 'Property'), el('th', null, 'Platform'), el('th', { class: 'num' }, 'Rating'), el('th', null, 'Review'), el('th', null, ''))));
+      const tb = el('tbody');
+      reviews.forEach(r => tb.appendChild(el('tr', null,
+        el('td', null, fmtDate(r.review_date)), el('td', null, r.property_name || '—'), el('td', null, r.platform || ''),
+        el('td', { class: 'num' }, (r.rating || 0) + '★'), el('td', null, (r.text || '').slice(0, 80)),
+        el('td', null, el('button', { class: 'btn-danger', onclick: async () => { if (confirm('Delete review?')) { await API.reviews.remove(r.id); setView('reviews'); } } }, 'Delete')))));
+      tbl.appendChild(tb); card.appendChild(tbl);
+    }
+    root.appendChild(card);
+  };
+  function reviewForm(r, props) {
+    const form = el('form', { class: 'form-grid' });
+    form.appendChild(formField('Property', select('property_id', [{ value: '', label: '—' }].concat(props.map(p => ({ value: String(p.id), label: p.nickname }))), r?.property_id || '')));
+    form.appendChild(formField('Platform', select('platform', ['Airbnb', 'VRBO', 'Cottages Canada', 'Google', 'Direct'].map(p => ({ value: p, label: p })), r?.platform || 'Airbnb')));
+    form.appendChild(formField('Rating (1–5)', input('rating', { type: 'number', step: '0.1', value: r?.rating || 5 })));
+    form.appendChild(formField('Date', input('review_date', { type: 'date', value: r?.review_date || isoToday() })));
+    form.appendChild(formField('Review text', textarea('text', r?.text), { full: true }));
+    form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, 'Save'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault(); const d = readForm(form);
+      try { await API.reviews.create({ property_id: d.property_id || null, platform: d.platform, rating: Number(d.rating) || 0, review_date: d.review_date, text: d.text }); toast('Saved', 'success'); closeModal(); setView('reviews'); } catch (err) {}
+    });
+    openModal('Add review', form);
+  }
+
+  // ---------- PRICING (PriceLabs) ----------
+  VIEWS.pricing = async (root) => {
+    const [data, props, listings] = await Promise.all([API.pricing(), API.properties.list(), API.pricelabs.listings().catch(() => [])]);
+    root.appendChild(el('div', { class: 'between' }, el('h1', null, 'Pricing — PriceLabs'),
+      el('button', { class: 'btn-primary', onclick: async (e) => { e.target.textContent = 'Refreshing…'; e.target.disabled = true; try { const r = await API.pricelabs.refresh(); toast('Pulled rates for ' + r.filter(x => !x.error).length + ' properties', 'success'); } catch (err) {} setView('pricing'); } }, '⟳ Refresh rates')));
+    if (data.listings_error) root.appendChild(el('div', { class: 'card', style: 'border-color:#fecaca;background:#fef2f2;' }, 'PriceLabs error: ' + data.listings_error));
+
+    data.properties.forEach(p => {
+      const card = el('div', { class: 'card' });
+      const listingOpts = [{ value: '', label: '— not linked —' }].concat(listings.map(l => ({ value: l.id + '|' + l.pms, label: l.name + ' (' + l.pms + ')' })));
+      const sel = select('pl_' + p.property_id, listingOpts, p.pricelabs_listing_id ? (p.pricelabs_listing_id + '|' + p.pricelabs_pms) : '');
+      sel.style.width = 'auto';
+      sel.addEventListener('change', async () => {
+        const [id, pms] = sel.value ? sel.value.split('|') : ['', ''];
+        await API.properties.update(p.property_id, { ...(props.find(x => x.id === p.property_id)), pricelabs_listing_id: id, pricelabs_pms: pms });
+        toast('Linked — click Refresh rates', 'success');
+      });
+      card.appendChild(el('div', { class: 'between' }, el('h2', null, p.nickname),
+        el('div', { style: 'display:flex;gap:8px;align-items:center;' }, el('span', { class: 'muted', style: 'font-size:12px;' }, 'PriceLabs listing'), sel)));
+      if (p.summary) {
+        const s = p.summary;
+        card.appendChild(el('div', { class: 'kpi-grid' },
+          kpi('Recommended base', s.recommended_base_price && s.recommended_base_price !== 'Unavailable' ? fmtMoney(s.recommended_base_price) : '—', `range ${fmtMoney(s.min)}–${fmtMoney(s.max)}`, 'success'),
+          kpi('Occupancy 30d', s.occupancy_next_30 || '—', `market ${s.market_occupancy_next_30 || '—'}`),
+          kpi('Occupancy 60d', s.occupancy_next_60 || '—', `market ${s.market_occupancy_next_60 || '—'}`),
+        ));
+      }
+      if (p.prices && p.prices.length) {
+        card.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin:8px 0 4px;' }, 'Next 14 nights (PriceLabs recommended):'));
+        const next = p.prices.filter(x => x.date >= isoToday()).slice(0, 14);
+        card.appendChild(simpleTable(['Date', { label: 'Recommended', num: true }, { label: 'Current', num: true }, { label: 'Min stay', num: true }, 'Demand'],
+          next.map(d => [fmtDate(d.date), fmtMoney(d.recommended_price), fmtMoney(d.user_price), (d.min_stay || '') + (d.min_stay ? 'n' : ''), d.demand || ''])));
+      } else if (p.pricelabs_listing_id) {
+        card.appendChild(el('div', { class: 'muted' }, 'No cached rates yet — click "Refresh rates".'));
+      } else {
+        card.appendChild(el('div', { class: 'muted' }, 'Link this property to a PriceLabs listing above to pull recommended nightly rates.'));
+      }
+      root.appendChild(card);
+    });
+  };
+
+  // ---------- GUEST MESSAGING ----------
+  VIEWS.messaging = async (root) => {
+    const [templates, scheduled, settings] = await Promise.all([API.messageTemplates.list(), API.messagesScheduled(), API.settings.get()]);
+    const autosend = !!settings.messaging_autosend_enabled;
+    root.appendChild(el('h1', null, 'Guest Messaging'));
+
+    // Autosend toggle
+    const toggleCard = el('div', { class: 'card', style: autosend ? '' : 'border-color:#fde68a;background:#fffbeb;' });
+    const cb = el('input', { type: 'checkbox', style: 'width:auto;' }); cb.checked = autosend;
+    cb.addEventListener('change', async () => { await API.settings.update({ messaging_autosend_enabled: cb.checked }); toast(cb.checked ? 'Auto-send ON' : 'Auto-send OFF', 'success'); setView('messaging'); });
+    toggleCard.appendChild(el('label', { style: 'display:flex;gap:10px;align-items:center;cursor:pointer;' }, cb,
+      el('div', null, el('strong', null, 'Automatic sending'),
+        el('div', { class: 'muted', style: 'font-size:13px;' }, autosend ? 'Messages send automatically via SMS when due.' : 'OFF — nothing sends automatically. Turn on once you\'ve reviewed templates. You can still "Send now" manually below.'))));
+    root.appendChild(toggleCard);
+
+    // Templates
+    const tcard = el('div', { class: 'card' });
+    tcard.appendChild(el('h2', null, 'Message Templates'));
+    tcard.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-bottom:8px;' }, 'Tokens: {guest} {property} {checkin} {checkout} {door_code} {address} {checkin_instructions}'));
+    templates.forEach(t => {
+      const row = el('div', { style: 'border-top:1px solid var(--border);padding:8px 0;' });
+      const en = el('input', { type: 'checkbox', style: 'width:auto;' }); en.checked = !!t.enabled;
+      en.addEventListener('change', async () => { await API.messageTemplates.update(t.id, { enabled: en.checked ? 1 : 0 }); toast('Updated', 'success'); });
+      row.appendChild(el('div', { style: 'display:flex;gap:8px;align-items:center;' }, en,
+        el('strong', null, t.stage.replace(/_/g, ' ')),
+        el('span', { class: 'muted', style: 'font-size:12px;' }, t.offset_days === 0 ? 'on the day' : (t.offset_days > 0 ? `${t.offset_days}d after` : `${-t.offset_days}d before`)),
+        el('button', { class: 'btn-ghost small', style: 'margin-left:auto;', onclick: () => templateForm(t) }, 'Edit')));
+      row.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-top:4px;' }, t.body));
+      tcard.appendChild(row);
+    });
+    root.appendChild(tcard);
+
+    // Scheduled queue (upcoming, unsent)
+    const qcard = el('div', { class: 'card' });
+    qcard.appendChild(el('h2', null, 'Upcoming & Due Messages'));
+    const pending = scheduled.filter(s => !s.sent).slice(0, 40);
+    if (!pending.length) qcard.appendChild(el('div', { class: 'empty' }, 'Nothing scheduled.'));
+    else pending.forEach(s => {
+      const due = s.due;
+      const row = el('div', { class: 'todo-item', style: 'align-items:flex-start;' });
+      const info = el('div', { style: 'flex:1;' },
+        el('div', null, el('strong', null, s.guest_name || '(no guest)'), ' · ', s.stage.replace(/_/g, ' '),
+          el('span', { class: due ? 'badge warning' : 'badge', style: 'margin-left:6px;' }, due ? 'DUE ' + fmtDate(s.send_date) : fmtDate(s.send_date))),
+        el('div', { class: 'muted', style: 'font-size:12px;' }, (s.property_name || '') + (s.guest_phone ? '' : ' · ⚠ no phone on file') + ' — ' + (s.preview || '').slice(0, 70)));
+      const btn = el('button', { class: 'btn-ghost small', onclick: async () => {
+        if (!s.guest_phone) { toast('Guest has no phone number', 'error'); return; }
+        if (!confirm('Send this ' + s.stage.replace(/_/g, ' ') + ' SMS to ' + s.guest_name + '?')) return;
+        btn.textContent = 'Sending…'; btn.disabled = true;
+        try { await API.sendMessage({ booking_id: s.booking_id, stage: s.stage }); toast('Sent', 'success'); setView('messaging'); }
+        catch (e) { btn.textContent = 'Send now'; btn.disabled = false; }
+      } }, 'Send now');
+      row.appendChild(info); row.appendChild(btn);
+      qcard.appendChild(row);
+    });
+    root.appendChild(qcard);
+  };
+  function templateForm(t) {
+    const form = el('form', { class: 'form-grid' });
+    form.appendChild(formField('Offset days (− before / + after anchor)', input('offset_days', { type: 'number', value: t.offset_days })));
+    form.appendChild(formField('Send hour (0–23)', input('send_hour', { type: 'number', value: t.send_hour })));
+    form.appendChild(formField('Message body', textarea('body', t.body, { rows: 5 }), { full: true }));
+    form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, 'Save template'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault(); const d = readForm(form);
+      try { await API.messageTemplates.update(t.id, { body: d.body, offset_days: Number(d.offset_days) || 0, send_hour: Number(d.send_hour) || 9 }); toast('Saved', 'success'); closeModal(); setView('messaging'); } catch (e) {}
+    });
+    openModal('Edit ' + t.stage.replace(/_/g, ' ') + ' template', form);
+  }
+
+  // ---------- SETTINGS ----------
+  VIEWS.settings = async (root) => {
+    const s = await API.settings.get();
+    root.appendChild(el('h1', null, 'Settings'));
+    const form = el('form', { class: 'card form-grid' });
+    form.appendChild(formField('Tax set-aside %', input('tax_setaside_percent', { type: 'number', step: '0.5', value: s.tax_setaside_percent == null ? 25 : s.tax_setaside_percent })));
+    const autocb = el('input', { type: 'checkbox', name: 'messaging_autosend_enabled', style: 'width:auto;' }); autocb.checked = !!s.messaging_autosend_enabled;
+    form.appendChild(el('label', { style: 'grid-column:1/-1;display:flex;gap:8px;align-items:center;' }, autocb, 'Auto-send guest messages (SMS) when due'));
+    form.appendChild(el('div', { class: 'muted', style: 'grid-column:1/-1;font-size:12px;' }, 'Tax set-aside is applied to net profit on the Money tab (HST/MAT/income). Channel fees are edited on the Money tab.'));
+    form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' }, el('button', { class: 'btn-primary', type: 'submit' }, 'Save settings')));
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault(); const d = readForm(form);
+      await API.settings.update({ tax_setaside_percent: Number(d.tax_setaside_percent) || 0, messaging_autosend_enabled: autocb.checked });
+      toast('Settings saved', 'success'); setView('settings');
+    });
+    root.appendChild(form);
+  };
+
+  // ---------- LOGIN GATE + BOOT ----------
+  function showLogin(message) {
+    const bar = document.querySelector('.topbar'); if (bar) bar.style.display = 'none';
+    let ov = $('#loginOverlay');
+    if (!ov) { ov = el('div', { id: 'loginOverlay', class: 'login-overlay' }); document.body.appendChild(ov); }
+    ov.innerHTML = '';
+    const form = el('form', { class: 'login-card' });
+    const email = el('input', { type: 'email', placeholder: 'Email', autocomplete: 'username', required: 'true' });
+    const pass = el('input', { type: 'password', placeholder: 'Password', autocomplete: 'current-password', required: 'true' });
+    const errBox = el('div', { class: 'login-err' });
+    const btn = el('button', { class: 'btn-primary', type: 'submit' }, 'Sign in');
+    form.appendChild(el('h1', null, 'Rental Tracker'));
+    form.appendChild(el('p', { class: 'muted', style: 'margin:0 0 12px;' }, 'Sign in to your command center'));
+    if (message) form.appendChild(el('div', { class: 'login-msg' }, message));
+    form.appendChild(email); form.appendChild(pass); form.appendChild(errBox); form.appendChild(btn);
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault(); errBox.textContent = ''; btn.disabled = true; btn.textContent = 'Signing in…';
+      try { await Auth.login(email.value.trim(), pass.value); ov.remove(); await startApp(); }
+      catch (err) { errBox.textContent = err.message || 'Login failed'; btn.disabled = false; btn.textContent = 'Sign in'; }
+    });
+    ov.appendChild(form);
+    ov.style.display = 'flex';
+    setTimeout(() => email.focus(), 50);
+  }
+
+  function ensureLogoutButton() {
+    if ($('#logoutBtn')) return;
+    const bar = document.querySelector('.topbar'); if (!bar) return;
+    bar.appendChild(el('div', { style: 'display:flex;align-items:center;gap:8px;margin-left:8px;' },
+      el('span', { class: 'muted', id: 'userEmail', style: 'font-size:12px;' }, (Auth.session && Auth.session.email) || ''),
+      el('button', { id: 'logoutBtn', class: 'btn-ghost small', onclick: () => { Auth.logout(); location.reload(); } }, 'Log out'),
+    ));
+  }
+
+  let appStarted = false;
+  async function startApp() {
+    const bar = document.querySelector('.topbar'); if (bar) bar.style.display = '';
+    if (!appStarted) { appStarted = true; ensureLogoutButton(); refreshBadges(); setInterval(refreshBadges, 30000); }
+    const ue = $('#userEmail'); if (ue && Auth.session) ue.textContent = Auth.session.email;
+    setView('dashboard');
+  }
+
+  (async function boot() {
+    try { await Auth.loadConfig(); } catch (e) {}
+    Auth.restore();
+    const token = await Auth.token();
+    if (token) await startApp(); else showLogin();
+  })();
 })();

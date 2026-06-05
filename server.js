@@ -27,7 +27,7 @@ const twilio = require('twilio');
   }
 })();
 
-const PORT = 3004;
+const PORT = process.env.PORT || 3004;
 
 // Twilio SMS config (env-only - never commit real values)
 const TWILIO_SID  = process.env.TWILIO_ACCOUNT_SID || '';
@@ -37,20 +37,12 @@ const twilioClient = (TWILIO_SID && TWILIO_AUTH) ? twilio(TWILIO_SID, TWILIO_AUT
 if (!twilioClient) {
   console.warn('[startup] Twilio creds not set - SMS features disabled. Copy .env.example to .env and fill in values.');
 }
-const DB_PATH = path.join(__dirname, 'rental.db.json');
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
-if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR);
+// Licensing attachments live in the private Supabase Storage bucket (below), so files are
+// held in memory just long enough to upload — no local disk, serverless-safe.
+const UPLOAD_BUCKET = 'rental-uploads';
 
-// Multer config — store files with unique names
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    const base = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 60);
-    cb(null, Date.now() + '-' + base + ext);
-  },
-});
-const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } }); // 20 MB max
+// In-memory upload (file.buffer) — streamed straight to Supabase Storage.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }); // 20 MB max
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -64,97 +56,229 @@ app.use('/api/public', (req, res, next) => {
 });
 
 app.use(express.static(path.join(__dirname, 'public')));
-app.use('/uploads', express.static(UPLOADS_DIR));
 
-const EMPTY = {
-  next_id: { properties: 1, booking_types: 1, guests: 1, bookings: 1, cleaners: 1, maintenance_items: 1, synced_events: 1, cleaner_tasks: 1, booking_requests: 1, todos: 1, licensing_items: 1, sms_messages: 1 },
-  properties: [], booking_types: [], guests: [], bookings: [],
-  cleaners: [], maintenance_items: [], synced_events: [],
-  cleaner_tasks: [], booking_requests: [], todos: [],
-  licensing_items: [], sms_messages: [],
+// ---------- SUPABASE-BACKED STORE ----------
+// Single-process design: an in-memory `store` (same shape the app always used) is the
+// working copy; every mutation is also streamed to Supabase Postgres through a serialized,
+// non-blocking write queue so reads stay synchronous and no endpoint code had to change.
+// NOTE: this assumes ONE always-on server instance (Render/Railway/local). A multi-instance
+// or serverless (Vercel) deploy would need per-request reads instead — see Phase 5.
+const { createClient } = require('@supabase/supabase-js');
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || SUPABASE_SERVICE_ROLE_KEY.startsWith('PASTE_')) {
+  console.error('[startup] Missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY in .env — cannot start.');
+  process.exit(1);
+}
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
+
+const TABLE_KEYS = ['properties','booking_types','guests','cleaners','bookings','maintenance_items','synced_events','cleaner_tasks','booking_requests','todos','licensing_items','sms_messages','manual_blocks','expenses','upsells','booking_upsells','reviews','message_templates','settings','price_cache'];
+const tbl = k => 'rental_' + k;
+// Whitelisted columns per table — strips any computed/extra props before writing to Postgres.
+const COLS = {
+  properties: ['id','created_at','nickname','address','airbnb_ical_url','vrbo_ical_url','notes','welcome_message','default_cleaner_id','public_bookable','license_status','license_renewal_date','check_in_instructions','nearby_attractions','contact_info','pricelabs_listing_id','pricelabs_pms'],
+  booking_types: ['id','created_at','name','fee_percent','is_direct'],
+  guests: ['id','created_at','name','email','phone','address','notes'],
+  cleaners: ['id','created_at','name','phone','email','rate','notes'],
+  bookings: ['id','created_at','property_id','booking_type_id','guest_id','check_in','check_out','amount','contact_name','notes','invite_sent','source_uid','guest_notified_at','door_code','status'],
+  maintenance_items: ['id','created_at','property_id','item_name','category','in_stock','notes'],
+  synced_events: ['id','created_at','property_id','source','uid','summary','start_date','end_date','last_synced'],
+  cleaner_tasks: ['id','created_at','cleaner_id','property_id','booking_id','due_date','status','notes','notified_at','notify_sid'],
+  booking_requests: ['id','created_at','property_id','guest_name','guest_email','guest_phone','check_in','check_out','guests_count','message','status','approved_booking_id'],
+  todos: ['id','created_at','title','description','priority','due_date','property_id','status','completed_at'],
+  licensing_items: ['id','created_at','property_id','step_name','description','bylaw_ref','sort_order','status','notes','completed_date','attachments','uploads_allowed'],
+  sms_messages: ['id','created_at','direction','from_number','to_number','body','twilio_sid','guest_id','cleaner_id','property_id','received_at','sent_at','read','booking_id','stage'],
+  manual_blocks: ['id','created_at','property_id','start_date','end_date','reason'],
+  expenses: ['id','created_at','property_id','date','category','amount','vendor','notes','recurring'],
+  upsells: ['id','created_at','name','default_price','active'],
+  booking_upsells: ['id','created_at','booking_id','name','price','qty'],
+  reviews: ['id','created_at','booking_id','property_id','platform','rating','text','review_date'],
+  message_templates: ['id','created_at','stage','channel','subject','body','enabled','offset_days','send_hour'],
+  settings: ['id','created_at','key','value'],
+  price_cache: ['id','created_at','property_id','date','recommended_price','user_price','min_stay','demand','currency','fetched_at'],
 };
+function pickCols(table, row) {
+  const allow = COLS[table]; if (!allow) return row;
+  const out = {}; for (const c of allow) if (row[c] !== undefined) out[c] = row[c];
+  return out;
+}
 
-let store;
-function loadStore() {
-  try {
-    store = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
-    for (const k of Object.keys(EMPTY)) if (!(k in store)) store[k] = EMPTY[k];
-    for (const k of Object.keys(EMPTY.next_id)) {
-      if (store.next_id[k] == null) store.next_id[k] = (store[k]?.length || 0) + 1;
-    }
-    store.properties.forEach(p => {
-      if (p.welcome_message == null) p.welcome_message = '';
-      if (p.default_cleaner_id == null) p.default_cleaner_id = null;
-      if (p.public_bookable == null) p.public_bookable = 0;
-      if (p.check_in_instructions == null) p.check_in_instructions = '';
-      if (p.nearby_attractions == null) p.nearby_attractions = '';
-      if (p.contact_info == null) p.contact_info = '';
-      if (p.license_status == null) p.license_status = 'unlicensed';
-      if (p.license_renewal_date == null) p.license_renewal_date = null;
-    });
-    // Migrate existing licensing_items
-    const UPLOAD_STEP_NAMES = new Set(['Exterior Photographs', 'Site Plan & Floor Plan', 'Parking Management Plan']);
-    (store.licensing_items || []).forEach(l => {
-      if (l.attachments == null) l.attachments = [];
-      if (l.uploads_allowed == null) l.uploads_allowed = UPLOAD_STEP_NAMES.has(l.step_name) ? 1 : 0;
-    });
-  } catch (e) {
-    store = JSON.parse(JSON.stringify(EMPTY));
-    saveStore();
+// Per-request store (serverless-safe). Each /api request loads a fresh snapshot of all
+// rental_* tables into a request-scoped context (AsyncLocalStorage). Reads are synchronous
+// against that snapshot; writes mutate the snapshot AND queue a Supabase op that is flushed
+// BEFORE the response is sent. Safe on Vercel serverless (no shared cross-instance memory).
+const { AsyncLocalStorage } = require('async_hooks');
+const als = new AsyncLocalStorage();
+function ctx() { return als.getStore(); }
+
+const NUMERIC = {
+  bookings: ['amount'], cleaners: ['rate'], expenses: ['amount'], upsells: ['default_price'],
+  booking_upsells: ['price', 'qty'], reviews: ['rating'], booking_types: ['fee_percent'],
+  price_cache: ['recommended_price', 'user_price'],
+};
+async function loadSnapshot() {
+  const snap = { next_id: {} };
+  await Promise.all(TABLE_KEYS.map(async (k) => {
+    const { data, error } = await supabase.from(tbl(k)).select('*').order('id', { ascending: true });
+    if (error) throw new Error(`load ${k}: ${error.message}`);
+    const rows = data || [];
+    (NUMERIC[k] || []).forEach(f => rows.forEach(r => { if (r[f] != null) r[f] = Number(r[f]); }));
+    snap[k] = rows;
+    snap.next_id[k] = rows.reduce((m, r) => Math.max(m, r.id || 0), 0) + 1;
+  }));
+  return snap;
+}
+
+// `store` proxies to the active request's snapshot so all existing `store.x` code works unchanged.
+const store = new Proxy({}, {
+  get(_, k) { const c = ctx(); return c ? c.store[k] : undefined; },
+  set(_, k, v) { const c = ctx(); if (c) c.store[k] = v; return true; },
+});
+
+// Per-request write queue, applied in order and awaited before the response is sent.
+function enqueueWrite(fn, label) { const c = ctx(); if (c) c.pending.push({ fn, label }); }
+async function flushCtx(c) {
+  if (!c || c._flushed) return; c._flushed = true;
+  for (const w of c.pending) {
+    try { await w.fn(); } catch (e) { throw new Error(w.label + ': ' + (e && e.message || e)); }
   }
+  c.pending = [];
 }
-function saveStore() {
-  fs.writeFileSync(DB_PATH + '.tmp', JSON.stringify(store, null, 2));
-  fs.renameSync(DB_PATH + '.tmp', DB_PATH);
+function flushWrites() { const c = ctx(); return c ? flushCtx(c) : Promise.resolve(); }
+// Run a function inside a fresh request context (used by the local scheduler / seeding).
+async function withContext(fn) {
+  const snap = await loadSnapshot();
+  const c = { store: snap, pending: [] };
+  return als.run(c, async () => { const r = await fn(); await flushCtx(c); return r; });
 }
-loadStore();
 
 const nowIso = () => new Date().toISOString();
-function nextId(table) { return store.next_id[table]++; }
+function nextId(table) { return ctx().store.next_id[table]++; }
 function tableInsert(table, row) {
   const id = nextId(table);
   const newRow = { id, created_at: nowIso(), ...row };
   store[table].push(newRow);
-  saveStore();
+  enqueueWrite(async () => {
+    const { error } = await supabase.from(tbl(table)).insert(pickCols(table, newRow));
+    if (error) throw error;
+  }, `insert ${table} #${id}`);
   return newRow;
 }
 function tableUpdate(table, id, patch) {
   const idx = store[table].findIndex(r => r.id === Number(id));
   if (idx < 0) return null;
   store[table][idx] = { ...store[table][idx], ...patch };
-  saveStore();
+  enqueueWrite(async () => {
+    const { error } = await supabase.from(tbl(table)).update(pickCols(table, patch)).eq('id', Number(id));
+    if (error) throw error;
+  }, `update ${table} #${id}`);
   return store[table][idx];
 }
 function tableRemove(table, id) {
   const before = store[table].length;
   store[table] = store[table].filter(r => r.id !== Number(id));
-  saveStore();
+  enqueueWrite(async () => {
+    const { error } = await supabase.from(tbl(table)).delete().eq('id', Number(id));
+    if (error) throw error;
+  }, `delete ${table} #${id}`);
   return before - store[table].length;
 }
 function tableFind(table, id) { return store[table].find(r => r.id === Number(id)) || null; }
 function tableAll(table) { return store[table].slice(); }
+function saveStore() { /* no-op: each mutation streams to Supabase via enqueueWrite */ }
 
 function cascadeDeleteProperty(propertyId) {
-  store.bookings = store.bookings.filter(b => b.property_id !== Number(propertyId));
-  store.maintenance_items = store.maintenance_items.filter(m => m.property_id !== Number(propertyId));
-  store.synced_events = store.synced_events.filter(s => s.property_id !== Number(propertyId));
-  store.cleaner_tasks = store.cleaner_tasks.filter(c => c.property_id !== Number(propertyId));
-  store.booking_requests = store.booking_requests.filter(r => r.property_id !== Number(propertyId));
-  store.licensing_items = store.licensing_items.filter(l => l.property_id !== Number(propertyId));
-  store.todos.forEach(t => { if (t.property_id === Number(propertyId)) t.property_id = null; });
+  const pid = Number(propertyId);
+  store.bookings = store.bookings.filter(b => b.property_id !== pid);
+  store.maintenance_items = store.maintenance_items.filter(m => m.property_id !== pid);
+  store.synced_events = store.synced_events.filter(s => s.property_id !== pid);
+  store.manual_blocks = store.manual_blocks.filter(b => b.property_id !== pid);
+  store.cleaner_tasks = store.cleaner_tasks.filter(c => c.property_id !== pid);
+  store.booking_requests = store.booking_requests.filter(r => r.property_id !== pid);
+  store.licensing_items = store.licensing_items.filter(l => l.property_id !== pid);
+  store.todos.forEach(t => { if (t.property_id === pid) t.property_id = null; });
+  enqueueWrite(async () => {
+    for (const k of ['bookings','maintenance_items','synced_events','manual_blocks','cleaner_tasks','booking_requests','licensing_items']) {
+      const { error } = await supabase.from(tbl(k)).delete().eq('property_id', pid);
+      if (error) throw error;
+    }
+    const { error } = await supabase.from(tbl('todos')).update({ property_id: null }).eq('property_id', pid);
+    if (error) throw error;
+  }, `cascade delete property ${pid}`);
 }
-function cascadeNullGuest(id) { store.bookings.forEach(b => { if (b.guest_id === Number(id)) b.guest_id = null; }); }
-function cascadeNullBookingType(id) { store.bookings.forEach(b => { if (b.booking_type_id === Number(id)) b.booking_type_id = null; }); }
+function cascadeNullGuest(id) {
+  const gid = Number(id);
+  store.bookings.forEach(b => { if (b.guest_id === gid) b.guest_id = null; });
+  enqueueWrite(async () => { const { error } = await supabase.from(tbl('bookings')).update({ guest_id: null }).eq('guest_id', gid); if (error) throw error; }, `null guest ${gid}`);
+}
+function cascadeNullBookingType(id) {
+  const tid = Number(id);
+  store.bookings.forEach(b => { if (b.booking_type_id === tid) b.booking_type_id = null; });
+  enqueueWrite(async () => { const { error } = await supabase.from(tbl('bookings')).update({ booking_type_id: null }).eq('booking_type_id', tid); if (error) throw error; }, `null booking_type ${tid}`);
+}
 function cascadeNullCleaner(id) {
-  store.cleaner_tasks = store.cleaner_tasks.filter(t => t.cleaner_id !== Number(id));
-  store.properties.forEach(p => { if (p.default_cleaner_id === Number(id)) p.default_cleaner_id = null; });
+  const cid = Number(id);
+  store.cleaner_tasks = store.cleaner_tasks.filter(t => t.cleaner_id !== cid);
+  store.properties.forEach(p => { if (p.default_cleaner_id === cid) p.default_cleaner_id = null; });
+  enqueueWrite(async () => {
+    let r = await supabase.from(tbl('cleaner_tasks')).delete().eq('cleaner_id', cid); if (r.error) throw r.error;
+    r = await supabase.from(tbl('properties')).update({ default_cleaner_id: null }).eq('default_cleaner_id', cid); if (r.error) throw r.error;
+  }, `null cleaner ${cid}`);
 }
 
-(function seedDefaults() {
+// Default platform economics: fee % charged by each channel + whether it's a "direct" booking.
+const CHANNEL_DEFAULTS = {
+  'Airbnb': { fee_percent: 3, is_direct: 0 },
+  'VRBO': { fee_percent: 5, is_direct: 0 },
+  'Cottages Canada': { fee_percent: 10, is_direct: 0 },
+  'Private': { fee_percent: 0, is_direct: 1 },
+};
+const DEFAULT_UPSELLS = [
+  { name: 'Firewood (bundle)', default_price: 25 },
+  { name: 'Early check-in', default_price: 50 },
+  { name: 'Late checkout', default_price: 50 },
+  { name: 'Pet fee', default_price: 75 },
+  { name: 'Mid-stay clean', default_price: 120 },
+  { name: 'Hot tub heating', default_price: 60 },
+  { name: 'Boat / kayak rental', default_price: 80 },
+  { name: 'Welcome basket', default_price: 40 },
+];
+const DEFAULT_MESSAGE_TEMPLATES = [
+  { stage: 'confirmation', offset_days: 0, send_hour: 10, subject: 'Booking confirmed', body: 'Hi {guest}, your stay at {property} is confirmed for {checkin} to {checkout}. We can\'t wait to host you!' },
+  { stage: 'pre_arrival', offset_days: -3, send_hour: 10, subject: 'Your stay is coming up', body: 'Hi {guest}! Your stay at {property} ({address}) starts {checkin}. Door code: {door_code}. {checkin_instructions}' },
+  { stage: 'checkin_day', offset_days: 0, send_hour: 11, subject: 'Welcome!', body: 'Welcome to {property}, {guest}! Your door code is {door_code}. Let us know if you need anything during your stay.' },
+  { stage: 'mid_stay', offset_days: 1, send_hour: 11, subject: 'How is everything?', body: 'Hi {guest}, just checking in — is everything good at {property}? Reply here if you need anything.' },
+  { stage: 'checkout_eve', offset_days: -1, send_hour: 18, subject: 'Checkout tomorrow', body: 'Hi {guest}, checkout from {property} is tomorrow ({checkout}). {checkin_instructions} Safe travels!' },
+  { stage: 'review_request', offset_days: 1, send_hour: 12, subject: 'Thanks for staying!', body: 'Thanks for staying at {property}, {guest}! If you enjoyed it, we\'d love a review — it helps us a lot. Hope to host you again!' },
+];
+const DEFAULT_SETTINGS = {
+  tax_setaside_percent: 25, // HST/MAT/income set-aside on net profit
+  pricelabs_enabled: true,
+  messaging_autosend_enabled: false, // OFF by default — never auto-blast real guests until enabled
+};
+
+async function seedDefaults() {
+  // Apply channel fee/direct defaults ONCE (column default is 0, so we can't rely on null);
+  // a settings flag makes this idempotent and lets the user edit fees freely afterward.
+  const channelSeeded = !!store.settings.find(s => s.key === 'channel_defaults_applied');
   for (const name of ['Airbnb', 'VRBO', 'Cottages Canada', 'Private']) {
-    if (!store.booking_types.find(t => t.name === name)) tableInsert('booking_types', { name });
+    let bt = store.booking_types.find(t => t.name === name);
+    if (!bt) bt = tableInsert('booking_types', { name });
+    const d = CHANNEL_DEFAULTS[name];
+    if (d && !channelSeeded) tableUpdate('booking_types', bt.id, { fee_percent: d.fee_percent, is_direct: d.is_direct });
   }
-})();
+  if (!channelSeeded) tableInsert('settings', { key: 'channel_defaults_applied', value: true });
+  if (!store.upsells.length) DEFAULT_UPSELLS.forEach(u => tableInsert('upsells', { name: u.name, default_price: u.default_price, active: 1 }));
+  if (!store.message_templates.length) DEFAULT_MESSAGE_TEMPLATES.forEach(t => tableInsert('message_templates', { ...t, channel: 'sms', enabled: 1 }));
+  for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
+    if (!store.settings.find(s => s.key === key)) tableInsert('settings', { key, value });
+  }
+  await flushWrites();
+}
+function getSetting(key, fallback) {
+  const s = store.settings.find(x => x.key === key);
+  return s ? s.value : fallback;
+}
 
 const DEFAULT_MAINTENANCE_ITEMS = [
   { item_name: 'Bed sheets (sets)', category: 'Linens' },
@@ -208,16 +332,77 @@ const DEFAULT_LICENSING_ITEMS = [
 const ok = (res, data) => res.json(data);
 const err = (res, code, msg) => res.status(code).json({ error: msg });
 
+// ---------- AUTH (Supabase) ----------
+// Login gate for the admin app. Public booking endpoints and the Twilio webhook are exempt.
+const ALLOWED_EMAILS = (process.env.RENTAL_ALLOWED_EMAILS || '')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+if (!ALLOWED_EMAILS.length) {
+  console.warn('[startup] RENTAL_ALLOWED_EMAILS is empty — no one will be able to log in. Set it in .env.');
+}
+async function requireAuth(req, res, next) {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+  if (!token) return err(res, 401, 'login required');
+  try {
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data || !data.user) return err(res, 401, 'invalid or expired session');
+    const email = (data.user.email || '').toLowerCase();
+    if (ALLOWED_EMAILS.length && !ALLOWED_EMAILS.includes(email)) return err(res, 403, 'this account is not authorized for the rental tracker');
+    req.user = data.user;
+    next();
+  } catch (e) { return err(res, 401, 'auth check failed'); }
+}
+// Per-request data snapshot + write-flush (serverless-safe). Runs for every /api request:
+// loads a fresh snapshot, then wraps the response so queued writes flush BEFORE sending.
+app.use('/api', async (req, res, next) => {
+  if (req.path === '/public/auth-config') return next(); // no data needed
+  let snap;
+  try { snap = await loadSnapshot(); }
+  catch (e) { return res.status(500).json({ error: 'data load failed: ' + e.message }); }
+  const c = { store: snap, pending: [] };
+  const origJson = res.json.bind(res);
+  const origSend = res.send.bind(res);
+  const fail = (e) => { if (!res.headersSent) res.status(500); };
+  res.json = (data) => { flushCtx(c).then(() => origJson(data), (e) => { fail(e); origJson({ error: 'save failed: ' + e.message }); }); return res; };
+  res.send = (body) => { flushCtx(c).then(() => origSend(body), (e) => { fail(e); origSend('save failed: ' + e.message); }); return res; };
+  als.run(c, () => next());
+});
+// Gate everything under /api except public booking, Twilio webhook, and cron.
+app.use('/api', (req, res, next) => {
+  if (req.path.startsWith('/public/') || req.path === '/twilio/incoming' || req.path.startsWith('/cron/')) return next();
+  return requireAuth(req, res, next);
+});
+// Browser login screen reads this to talk to Supabase Auth (anon key is safe to expose).
+app.get('/api/public/auth-config', (req, res) => ok(res, { url: SUPABASE_URL, anonKey: process.env.SUPABASE_ANON_KEY || '' }));
+
 function joinBooking(b) {
   const p = b.property_id ? tableFind('properties', b.property_id) : null;
   const t = b.booking_type_id ? tableFind('booking_types', b.booking_type_id) : null;
   const g = b.guest_id ? tableFind('guests', b.guest_id) : null;
+  const ups = store.booking_upsells.filter(u => u.booking_id === b.id);
+  const upsell_total = ups.reduce((a, u) => a + (Number(u.price) || 0) * (Number(u.qty) || 1), 0);
+  const fee_percent = t ? (Number(t.fee_percent) || 0) : 0;
+  const platform_fee = +(((Number(b.amount) || 0) * fee_percent) / 100).toFixed(2);
   return { ...b,
     property_name: p?.nickname || null,
     booking_type_name: t?.name || null,
+    booking_type_is_direct: t ? (t.is_direct ? 1 : 0) : 0,
     guest_name: g?.name || null,
     guest_email: g?.email || null,
+    guest_phone: g?.phone || null,
+    upsell_total,
+    upsells: ups,
+    platform_fee,
+    net_revenue: +(((Number(b.amount) || 0) + upsell_total) - platform_fee).toFixed(2),
   };
+}
+function joinExpense(e) {
+  const p = e.property_id ? tableFind('properties', e.property_id) : null;
+  return { ...e, property_name: p?.nickname || null };
+}
+function joinReview(r) {
+  const p = r.property_id ? tableFind('properties', r.property_id) : null;
+  return { ...r, property_name: p?.nickname || null };
 }
 
 function syncCleanerTaskForBooking(booking) {
@@ -242,8 +427,9 @@ function syncCleanerTaskForBooking(booking) {
   });
 }
 function removeCleanerTaskForBooking(bookingId) {
-  store.cleaner_tasks = store.cleaner_tasks.filter(t => t.booking_id !== Number(bookingId));
-  saveStore();
+  const bid = Number(bookingId);
+  store.cleaner_tasks = store.cleaner_tasks.filter(t => t.booking_id !== bid);
+  enqueueWrite(async () => { const { error } = await supabase.from(tbl('cleaner_tasks')).delete().eq('booking_id', bid); if (error) throw error; }, `delete cleaner_tasks for booking ${bid}`);
 }
 
 // ---------- PROPERTIES ----------
@@ -293,6 +479,8 @@ app.put('/api/properties/:id', (req, res) => {
     public_bookable: public_bookable ? 1 : 0,
     license_status: license_status || 'unlicensed',
     license_renewal_date: license_renewal_date || null,
+    ...(req.body.pricelabs_listing_id !== undefined ? { pricelabs_listing_id: req.body.pricelabs_listing_id || null } : {}),
+    ...(req.body.pricelabs_pms !== undefined ? { pricelabs_pms: req.body.pricelabs_pms || null } : {}),
   });
   if (!row) return err(res, 404, 'not found');
   store.bookings.filter(b => b.property_id === row.id).forEach(syncCleanerTaskForBooking);
@@ -362,6 +550,8 @@ function createBookingFromPayload(payload) {
     contact_name: contact_name || '',
     notes: notes || '',
     invite_sent: 0,
+    door_code: payload.door_code || '',
+    status: payload.status || 'confirmed',
   });
   syncCleanerTaskForBooking(row);
   return row;
@@ -413,7 +603,7 @@ app.post('/api/bookings/bulk', (req, res) => {
 app.put('/api/bookings/:id', (req, res) => {
   const existing = tableFind('bookings', req.params.id);
   if (!existing) return err(res, 404, 'not found');
-  const { property_id, booking_type_id, guest_id, check_in, check_out, amount, contact_name, notes, invite_sent } = req.body || {};
+  const { property_id, booking_type_id, guest_id, check_in, check_out, amount, contact_name, notes, invite_sent, door_code, status } = req.body || {};
   const row = tableUpdate('bookings', req.params.id, {
     property_id: property_id != null ? Number(property_id) : existing.property_id,
     booking_type_id: booking_type_id ? Number(booking_type_id) : (booking_type_id === null ? null : existing.booking_type_id),
@@ -424,6 +614,8 @@ app.put('/api/bookings/:id', (req, res) => {
     contact_name: contact_name != null ? contact_name : existing.contact_name,
     notes: notes != null ? notes : existing.notes,
     invite_sent: typeof invite_sent === 'number' ? invite_sent : existing.invite_sent,
+    door_code: door_code != null ? door_code : existing.door_code,
+    status: status != null ? status : (existing.status || 'confirmed'),
   });
   syncCleanerTaskForBooking(row);
   ok(res, joinBooking(row));
@@ -699,7 +891,12 @@ app.delete('/api/maintenance/:id', (req, res) => {
 async function fetchAndStoreIcal(property, source, url) {
   if (!url) return { source, count: 0, skipped: true };
   const events = await ical.async.fromURL(url);
+  // Replace this property+source's synced events (in memory and in Supabase).
   store.synced_events = store.synced_events.filter(e => !(e.property_id === property.id && e.source === source));
+  enqueueWrite(async () => {
+    const { error } = await supabase.from(tbl('synced_events')).delete().eq('property_id', property.id).eq('source', source);
+    if (error) throw error;
+  }, `clear synced_events property ${property.id} ${source}`);
   let count = 0;
   for (const k of Object.keys(events)) {
     const e = events[k];
@@ -713,7 +910,6 @@ async function fetchAndStoreIcal(property, source, url) {
     });
     count++;
   }
-  saveStore();
   return { source, count };
 }
 app.post('/api/sync/:propertyId', async (req, res) => {
@@ -739,29 +935,223 @@ app.post('/api/sync-all', async (req, res) => {
   ok(res, out);
 });
 
+// ---------- RESERVATION RECONCILIATION ----------
+// Cross-platform de-duplication: Airbnb/VRBO are synced to each other, so the same
+// stay can appear as (a) a manual booking, (b) a "Reserved" synced event, and (c) a
+// mirror "Blocked"/"Not available" event on the other platform. We collapse all of
+// that into one entry so the calendar reflects reality and conflicts are real.
+const BLOCKED_RE = /blocked|not\s*available|unavailable|closed/i;
+function classifySynced(summary) {
+  const s = (summary || '').trim();
+  if (!s) return 'blocked';
+  if (/reserv/i.test(s)) return 'reserved';
+  if (BLOCKED_RE.test(s)) return 'blocked';
+  // Some exports list just a guest name / "CONFIRMED" — treat as a real guest hold.
+  return 'reserved';
+}
+function parseGuestFromSummary(summary) {
+  const s = (summary || '').trim();
+  const m = s.match(/^(?:reserved|reservation)\s*[-–—:]\s*(.+)$/i);
+  return m ? m[1].trim() : '';
+}
+function addDays(iso, n) {
+  const d = new Date(iso + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function effEnd(start, end) {
+  // Checkout day is not occupied; a missing/equal end means a single night.
+  if (!end || end <= start) return addDays(start, 1);
+  return end;
+}
+function rangesOverlap(aStart, aEnd, bStart, bEnd) {
+  if (!aStart || !bStart) return false;
+  return aStart < effEnd(bStart, bEnd) && bStart < effEnd(aStart, aEnd);
+}
+function platformToTypeName(source) {
+  if (source === 'airbnb') return 'Airbnb';
+  if (source === 'vrbo') return 'VRBO';
+  return null;
+}
+function mergeBlocks(blocks) {
+  const byProp = {};
+  for (const b of blocks) (byProp[b.property_id] = byProp[b.property_id] || []).push(b);
+  const out = [];
+  for (const pid of Object.keys(byProp)) {
+    const list = byProp[pid].sort((a, b) => a.start.localeCompare(b.start));
+    let cur = null;
+    for (const b of list) {
+      const bEnd = b.end || b.start;
+      if (cur && b.start <= (cur.end || cur.start)) {
+        if (bEnd > (cur.end || cur.start)) cur.end = bEnd;
+        b.sources.forEach(s => cur.sources.add(s));
+      } else {
+        cur = { property_id: Number(pid), start: b.start, end: bEnd, sources: new Set(b.sources) };
+        out.push(cur);
+      }
+    }
+  }
+  return out;
+}
+
+// Returns a flat, de-duplicated, flagged list of calendar entries.
+function buildCalendarEvents() {
+  const events = [];
+  const bookingEvents = tableAll('bookings').map(joinBooking).map(b => ({
+    kind: 'booking', id: 'b' + b.id, booking_id: b.id,
+    property_id: b.property_id, property_name: b.property_name,
+    guest_name: b.guest_name || b.contact_name || null,
+    contact_name: b.contact_name || null,
+    title: `${b.property_name || 'Property'} — ${b.guest_name || b.contact_name || 'Booking'}`,
+    start: b.check_in, end: b.check_out || b.check_in,
+    source: b.booking_type_name || 'Manual', amount: b.amount,
+    platform_verified: false, synced_source: null,
+  }));
+  events.push(...bookingEvents);
+
+  const synced = tableAll('synced_events').map(s => ({ ...s, _class: classifySynced(s.summary) }));
+
+  // Reserved synced events → merge into a matching booking, else surface as "needs details".
+  const claimedSpans = [];
+  for (const s of synced.filter(e => e._class === 'reserved')) {
+    let match = bookingEvents.find(b => b.property_id === s.property_id &&
+      b.start === s.start_date && (b.end || b.start) === s.end_date);
+    if (!match) match = bookingEvents.find(b => b.property_id === s.property_id &&
+      rangesOverlap(b.start, b.end, s.start_date, s.end_date));
+    if (match) {
+      match.platform_verified = true;
+      match.synced_source = s.source;
+      claimedSpans.push({ property_id: s.property_id, start: s.start_date, end: s.end_date });
+    } else {
+      const p = tableFind('properties', s.property_id);
+      const guest = parseGuestFromSummary(s.summary);
+      events.push({
+        kind: 'reserved', id: 's' + s.id, synced_event_id: s.id,
+        property_id: s.property_id, property_name: p?.nickname || null,
+        guest_name: guest || null,
+        title: `${p?.nickname || 'Property'} — ${guest || s.summary || s.source}`,
+        start: s.start_date, end: s.end_date, source: s.source, needs_details: true,
+      });
+    }
+  }
+
+  // Synced blocks → drop cross-sync mirrors of real stays, merge the remainder.
+  const occupiedSpans = bookingEvents
+    .map(b => ({ property_id: b.property_id, start: b.start, end: b.end || b.start }))
+    .concat(claimedSpans);
+  const realBlocks = [];
+  for (const s of synced.filter(e => e._class === 'blocked')) {
+    const isMirror = occupiedSpans.some(sp => sp.property_id === s.property_id &&
+      rangesOverlap(sp.start, sp.end, s.start_date, s.end_date));
+    if (isMirror) continue;
+    realBlocks.push({ property_id: s.property_id, start: s.start_date, end: s.end_date || s.start_date, sources: new Set([s.source]) });
+  }
+  for (const blk of mergeBlocks(realBlocks)) {
+    const p = tableFind('properties', blk.property_id);
+    events.push({
+      kind: 'block', id: 'blk' + blk.property_id + '-' + blk.start,
+      property_id: blk.property_id, property_name: p?.nickname || null,
+      title: `${p?.nickname || 'Property'} — Blocked`,
+      start: blk.start, end: blk.end, source: [...blk.sources].join('/'),
+    });
+  }
+
+  // Manual blocks (owner-created) → always shown, individually editable/deletable.
+  for (const blk of tableAll('manual_blocks')) {
+    const p = tableFind('properties', blk.property_id);
+    events.push({
+      kind: 'block', manual: true, block_id: blk.id, id: 'mblk' + blk.id,
+      property_id: blk.property_id, property_name: p?.nickname || null,
+      title: `${p?.nickname || 'Property'} — ${blk.reason || 'Blocked'}`,
+      reason: blk.reason || 'Blocked', start: blk.start_date, end: blk.end_date || blk.start_date,
+      source: 'manual',
+    });
+  }
+
+  // Tasks (to-dos with a due date) so turnover work shows alongside bookings.
+  for (const t of tableAll('todos').map(joinTodo)) {
+    if (!t.due_date) continue;
+    events.push({
+      kind: 'task', id: 't' + t.id, todo_id: t.id,
+      property_id: t.property_id, property_name: t.property_name,
+      title: t.title, start: t.due_date, end: t.due_date,
+      priority: t.priority, status: t.status,
+    });
+  }
+
+  events.sort((a, b) => (a.start || '').localeCompare(b.start || ''));
+  return events;
+}
+
+// A conflict = two distinct guest entries (booking/reserved) overlapping at one property.
+function computeConflicts(events) {
+  const guests = events.filter(e => e.kind === 'booking' || e.kind === 'reserved');
+  const out = [];
+  for (let i = 0; i < guests.length; i++) {
+    for (let j = i + 1; j < guests.length; j++) {
+      const a = guests[i], b = guests[j];
+      if (a.property_id !== b.property_id) continue;
+      if (!rangesOverlap(a.start, a.end, b.start, b.end)) continue;
+      out.push({
+        property_id: a.property_id, property_name: a.property_name,
+        overlap_start: a.start > b.start ? a.start : b.start,
+        a: { id: a.id, kind: a.kind, guest_name: a.guest_name, start: a.start, end: a.end, source: a.source },
+        b: { id: b.id, kind: b.kind, guest_name: b.guest_name, start: b.start, end: b.end, source: b.source },
+      });
+    }
+  }
+  return out.sort((x, y) => (x.overlap_start || '').localeCompare(y.overlap_start || ''));
+}
+
 // ---------- CALENDAR ----------
 app.get('/api/calendar', (req, res) => {
-  const events = [];
-  for (const b of tableAll('bookings').map(joinBooking)) {
-    events.push({
-      kind: 'booking', id: 'b' + b.id,
-      property_id: b.property_id, property_name: b.property_name,
-      title: `${b.property_name || 'Property'} — ${b.guest_name || b.contact_name || 'Booking'}`,
-      start: b.check_in, end: b.check_out || b.check_in,
-      source: b.booking_type_name || 'Manual', amount: b.amount,
-    });
-  }
-  for (const s of tableAll('synced_events')) {
-    const p = tableFind('properties', s.property_id);
-    events.push({
-      kind: 'synced', id: 's' + s.id,
-      property_id: s.property_id, property_name: p?.nickname || null,
-      title: `${p?.nickname || 'Property'} — ${s.summary || s.source}`,
-      start: s.start_date, end: s.end_date, source: s.source,
-    });
-  }
-  events.sort((a, b) => (a.start || '').localeCompare(b.start || ''));
-  ok(res, events);
+  ok(res, buildCalendarEvents());
+});
+
+app.get('/api/conflicts', (req, res) => {
+  ok(res, computeConflicts(buildCalendarEvents()));
+});
+
+// Claim/enrich a synced Airbnb/VRBO reservation by creating a real booking linked to it.
+app.post('/api/synced-events/:id/claim', (req, res) => {
+  const s = tableFind('synced_events', req.params.id);
+  if (!s) return err(res, 404, 'synced event not found');
+  const body = req.body || {};
+  const typeName = platformToTypeName(s.source);
+  const matchedType = typeName ? store.booking_types.find(t => t.name.toLowerCase() === typeName.toLowerCase()) : null;
+  const booking = createBookingFromPayload({
+    property_id: s.property_id,
+    booking_type_id: body.booking_type_id || (matchedType ? matchedType.id : null),
+    guest_id: body.guest_id || null,
+    new_guest: body.new_guest || (body.guest_name ? { name: body.guest_name } : null),
+    check_in: body.check_in || s.start_date,
+    check_out: body.check_out || s.end_date,
+    amount: body.amount,
+    contact_name: body.contact_name || body.guest_name || '',
+    notes: body.notes || '',
+  });
+  const updated = tableUpdate('bookings', booking.id, { source_uid: s.uid });
+  ok(res, joinBooking(updated || booking));
+});
+
+// ---------- MANUAL BLOCKS (owner-created unavailable dates) ----------
+app.get('/api/blocks', (req, res) => {
+  ok(res, tableAll('manual_blocks').sort((a, b) => (a.start_date || '').localeCompare(b.start_date || '')));
+});
+app.post('/api/blocks', (req, res) => {
+  const { property_id, start_date, end_date, reason } = req.body || {};
+  if (!property_id) return err(res, 400, 'property_id required');
+  if (!start_date) return err(res, 400, 'start_date required');
+  ok(res, tableInsert('manual_blocks', {
+    property_id: Number(property_id),
+    start_date,
+    end_date: end_date || start_date,
+    reason: (reason || 'Blocked').trim() || 'Blocked',
+  }));
+});
+app.delete('/api/blocks/:id', (req, res) => {
+  tableRemove('manual_blocks', req.params.id);
+  ok(res, { ok: true });
 });
 
 // ---------- DASHBOARD ----------
@@ -872,8 +1262,26 @@ app.get('/api/dashboard', (req, res) => {
 
   const overdueTodoCount = openTodos.filter(t => t.due_date && t.due_date < todayIso).length;
 
+  // Double-booking guard + revenue completeness across platforms.
+  const calEvents = buildCalendarEvents();
+  const conflicts = computeConflicts(calEvents);
+  const unconfirmedReservations = calEvents.filter(e => e.kind === 'reserved').length;
+
+  // Profit + performance metrics (Phases C–H).
+  const fin = computeFinancials(year);
+  const metrics = computeMetrics(year);
+  const orphans = computeOrphans(2);
+
   ok(res, {
     year,
+    conflicts,
+    conflict_count: conflicts.length,
+    unconfirmed_reservations: unconfirmedReservations,
+    financials: fin,
+    metrics,
+    orphans,
+    orphan_count: orphans.length,
+    orphan_nights: orphans.reduce((a, o) => a + o.nights, 0),
     ytd_earnings: ytdEarnings,
     ytd_bookings: ytdBookings.length,
     ytd_nights: totalNightsYtd,
@@ -991,11 +1399,22 @@ function joinLicensingItem(l) {
   const p = l.property_id ? tableFind('properties', l.property_id) : null;
   return { ...l, property_name: p?.nickname || null };
 }
-app.get('/api/licensing', (req, res) => {
+// Sign all attachment paths in a set of licensing items (1h links for private-bucket files).
+async function signAttachments(rows) {
+  const paths = [];
+  rows.forEach(r => (r.attachments || []).forEach(a => { if (a.path) paths.push(a.path); }));
+  if (!paths.length) return rows;
+  const { data } = await supabase.storage.from(UPLOAD_BUCKET).createSignedUrls(paths, 3600);
+  const byPath = {}; (data || []).forEach(s => { if (s.path) byPath[s.path] = s.signedUrl; });
+  rows.forEach(r => { r.attachments = (r.attachments || []).map(a => ({ ...a, url: a.path ? byPath[a.path] || null : a.url || null })); });
+  return rows;
+}
+app.get('/api/licensing', async (req, res) => {
   const { property_id } = req.query;
   let rows = tableAll('licensing_items');
   if (property_id) rows = rows.filter(r => r.property_id === Number(property_id));
   rows = rows.map(joinLicensingItem).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
+  await signAttachments(rows);
   ok(res, rows);
 });
 app.post('/api/licensing', (req, res) => {
@@ -1043,32 +1462,40 @@ app.post('/api/licensing/seed/:propertyId', (req, res) => {
 
 
 // ---------- LICENSING FILE UPLOADS ----------
-app.post('/api/licensing/:id/upload', upload.array('files', 10), (req, res) => {
+app.post('/api/licensing/:id/upload', upload.array('files', 10), async (req, res) => {
   const item = tableFind('licensing_items', req.params.id);
   if (!item) return err(res, 404, 'licensing item not found');
   if (!item.uploads_allowed) return err(res, 400, 'this step does not support file uploads');
   if (!req.files || !req.files.length) return err(res, 400, 'no files uploaded');
-  const newAttachments = req.files.map(f => ({
-    filename: f.filename,
-    original_name: f.originalname,
-    size: f.size,
-    mime_type: f.mimetype,
-    uploaded_at: nowIso(),
-  }));
+  const ts = Date.now();
+  const newAttachments = [];
+  for (let i = 0; i < req.files.length; i++) {
+    const f = req.files[i];
+    const ext = path.extname(f.originalname);
+    const base = path.basename(f.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 60);
+    const objectPath = `licensing/${item.id}/${ts}-${i}-${base}${ext}`;
+    const up = await supabase.storage.from(UPLOAD_BUCKET).upload(objectPath, f.buffer, { contentType: f.mimetype, upsert: false });
+    if (up.error) return err(res, 500, 'upload failed: ' + up.error.message);
+    newAttachments.push({ path: objectPath, original_name: f.originalname, size: f.size, mime_type: f.mimetype, uploaded_at: nowIso() });
+  }
   const attachments = [...(item.attachments || []), ...newAttachments];
   const updated = tableUpdate('licensing_items', item.id, { attachments });
-  ok(res, joinLicensingItem(updated));
+  const out = [joinLicensingItem(updated)];
+  await signAttachments(out);
+  ok(res, out[0]);
 });
 
-app.delete('/api/licensing/:id/upload/:filename', (req, res) => {
+app.delete('/api/licensing/:id/attachment', async (req, res) => {
   const item = tableFind('licensing_items', req.params.id);
   if (!item) return err(res, 404, 'licensing item not found');
-  const filename = req.params.filename;
-  const attachments = (item.attachments || []).filter(a => a.filename !== filename);
-  const filePath = path.join(UPLOADS_DIR, filename);
-  try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (e) {}
+  const objectPath = req.query.path || (req.body && req.body.path);
+  if (!objectPath) return err(res, 400, 'path required');
+  try { await supabase.storage.from(UPLOAD_BUCKET).remove([objectPath]); } catch (e) {}
+  const attachments = (item.attachments || []).filter(a => a.path !== objectPath);
   const updated = tableUpdate('licensing_items', item.id, { attachments });
-  ok(res, joinLicensingItem(updated));
+  const out = [joinLicensingItem(updated)];
+  await signAttachments(out);
+  ok(res, out[0]);
 });
 
 // ---------- BOOKING REQUESTS ----------
@@ -1122,4 +1549,415 @@ app.post('/api/public/guest-lookup', (req, res) => {
     .map(joinBooking)
     .sort((a, b) => (b.check_in || '').localeCompare(a.check_in || ''))
     .map(b => ({ property_id: b.property_id, property_name: b.property_name, check_in: b.check_in, check_out: b.check_out }));
-  ok(res, { fo
+  ok(res, { found: true, name: guest.name, stays });
+});
+app.post('/api/public/booking-requests', (req, res) => {
+  const b = req.body || {};
+  const guest_name = (b.guest_name || '').trim();
+  const guest_email = (b.guest_email || '').trim();
+  const property_id = b.property_id ? Number(b.property_id) : null;
+  const check_in = b.check_in || null;
+  if (!guest_email || !property_id || !check_in) {
+    return err(res, 400, 'guest_email, property_id and check_in are required');
+  }
+  const property = tableFind('properties', property_id);
+  if (!property || !property.public_bookable) {
+    return err(res, 400, 'property is not bookable');
+  }
+  const row = tableInsert('booking_requests', {
+    property_id,
+    guest_name,
+    guest_email,
+    guest_phone: (b.guest_phone || '').trim(),
+    check_in,
+    check_out: b.check_out || null,
+    proposed_amount: Number(b.proposed_amount) || 0,
+    message: (b.message || '').trim(),
+    status: 'pending',
+    approved_booking_id: null,
+  });
+  ok(res, joinBookingRequest(row));
+});
+
+// ====================================================================
+// PROFIT & AUTOMATION FEATURES (Phases C–H)
+// ====================================================================
+
+// ---------- EXPENSES ----------
+app.get('/api/expenses', (req, res) => {
+  let rows = tableAll('expenses').map(joinExpense);
+  if (req.query.property_id) rows = rows.filter(e => String(e.property_id) === String(req.query.property_id));
+  if (req.query.year) rows = rows.filter(e => (e.date || '').slice(0, 4) === String(req.query.year));
+  ok(res, rows.sort((a, b) => (b.date || '').localeCompare(a.date || '')));
+});
+app.post('/api/expenses', (req, res) => {
+  const b = req.body || {};
+  if (!b.amount) return err(res, 400, 'amount required');
+  ok(res, joinExpense(tableInsert('expenses', {
+    property_id: b.property_id ? Number(b.property_id) : null,
+    date: b.date || nowIso().slice(0, 10),
+    category: b.category || 'Other',
+    amount: Number(b.amount) || 0,
+    vendor: b.vendor || '',
+    notes: b.notes || '',
+    recurring: b.recurring ? 1 : 0,
+  })));
+});
+app.put('/api/expenses/:id', (req, res) => {
+  const b = req.body || {};
+  const patch = {};
+  ['date', 'category', 'vendor', 'notes'].forEach(k => { if (b[k] != null) patch[k] = b[k]; });
+  if (b.amount != null) patch.amount = Number(b.amount) || 0;
+  if (b.property_id !== undefined) patch.property_id = b.property_id ? Number(b.property_id) : null;
+  if (b.recurring != null) patch.recurring = b.recurring ? 1 : 0;
+  const row = tableUpdate('expenses', req.params.id, patch);
+  if (!row) return err(res, 404, 'not found'); ok(res, joinExpense(row));
+});
+app.delete('/api/expenses/:id', (req, res) => { tableRemove('expenses', req.params.id); ok(res, { ok: true }); });
+
+// ---------- UPSELLS (catalog) ----------
+app.get('/api/upsells', (req, res) => ok(res, tableAll('upsells').sort((a, b) => (a.name || '').localeCompare(b.name || ''))));
+app.post('/api/upsells', (req, res) => {
+  const b = req.body || {};
+  if (!b.name) return err(res, 400, 'name required');
+  ok(res, tableInsert('upsells', { name: b.name, default_price: Number(b.default_price) || 0, active: b.active === 0 ? 0 : 1 }));
+});
+app.put('/api/upsells/:id', (req, res) => {
+  const b = req.body || {};
+  const patch = {};
+  if (b.name != null) patch.name = b.name;
+  if (b.default_price != null) patch.default_price = Number(b.default_price) || 0;
+  if (b.active != null) patch.active = b.active ? 1 : 0;
+  const row = tableUpdate('upsells', req.params.id, patch);
+  if (!row) return err(res, 404, 'not found'); ok(res, row);
+});
+app.delete('/api/upsells/:id', (req, res) => { tableRemove('upsells', req.params.id); ok(res, { ok: true }); });
+
+// ---------- BOOKING UPSELLS (per-booking add-ons) ----------
+app.get('/api/booking-upsells', (req, res) => {
+  let rows = tableAll('booking_upsells');
+  if (req.query.booking_id) rows = rows.filter(u => String(u.booking_id) === String(req.query.booking_id));
+  ok(res, rows);
+});
+app.post('/api/booking-upsells', (req, res) => {
+  const b = req.body || {};
+  if (!b.booking_id || !b.name) return err(res, 400, 'booking_id and name required');
+  ok(res, tableInsert('booking_upsells', {
+    booking_id: Number(b.booking_id), name: b.name,
+    price: Number(b.price) || 0, qty: Number(b.qty) || 1,
+  }));
+});
+app.delete('/api/booking-upsells/:id', (req, res) => { tableRemove('booking_upsells', req.params.id); ok(res, { ok: true }); });
+
+// ---------- REVIEWS ----------
+app.get('/api/reviews', (req, res) => ok(res, tableAll('reviews').map(joinReview).sort((a, b) => (b.review_date || '').localeCompare(a.review_date || ''))));
+app.post('/api/reviews', (req, res) => {
+  const b = req.body || {};
+  ok(res, joinReview(tableInsert('reviews', {
+    booking_id: b.booking_id ? Number(b.booking_id) : null,
+    property_id: b.property_id ? Number(b.property_id) : null,
+    platform: b.platform || '', rating: Number(b.rating) || 0,
+    text: b.text || '', review_date: b.review_date || nowIso().slice(0, 10),
+  })));
+});
+app.put('/api/reviews/:id', (req, res) => {
+  const b = req.body || {}; const patch = {};
+  ['platform', 'text', 'review_date'].forEach(k => { if (b[k] != null) patch[k] = b[k]; });
+  if (b.rating != null) patch.rating = Number(b.rating) || 0;
+  if (b.property_id !== undefined) patch.property_id = b.property_id ? Number(b.property_id) : null;
+  const row = tableUpdate('reviews', req.params.id, patch);
+  if (!row) return err(res, 404, 'not found'); ok(res, joinReview(row));
+});
+app.delete('/api/reviews/:id', (req, res) => { tableRemove('reviews', req.params.id); ok(res, { ok: true }); });
+
+// ---------- SETTINGS ----------
+app.get('/api/settings', (req, res) => {
+  const out = {}; tableAll('settings').forEach(s => { out[s.key] = s.value; }); ok(res, out);
+});
+app.put('/api/settings', (req, res) => {
+  const body = req.body || {};
+  for (const [key, value] of Object.entries(body)) {
+    const existing = store.settings.find(s => s.key === key);
+    if (existing) tableUpdate('settings', existing.id, { value });
+    else tableInsert('settings', { key, value });
+  }
+  const out = {}; tableAll('settings').forEach(s => { out[s.key] = s.value; }); ok(res, out);
+});
+
+// ---------- CHANNEL ECONOMICS (booking type fee config) ----------
+app.put('/api/booking-types/:id', (req, res) => {
+  const b = req.body || {}; const patch = {};
+  if (b.fee_percent != null) patch.fee_percent = Number(b.fee_percent) || 0;
+  if (b.is_direct != null) patch.is_direct = b.is_direct ? 1 : 0;
+  if (b.name != null) patch.name = b.name;
+  const row = tableUpdate('booking_types', req.params.id, patch);
+  if (!row) return err(res, 404, 'not found'); ok(res, row);
+});
+
+// ---------- FINANCIALS / NET PROFIT ----------
+function computeFinancials(year) {
+  const yStart = `${year}-01-01`, yEnd = `${year}-12-31`;
+  const bookings = tableAll('bookings').map(joinBooking)
+    .filter(b => b.status !== 'cancelled' && b.check_in >= yStart && b.check_in <= yEnd);
+  const expenses = tableAll('expenses').filter(e => (e.date || '') >= yStart && (e.date || '') <= yEnd);
+  const gross = bookings.reduce((a, b) => a + (b.amount || 0), 0);
+  const upsell = bookings.reduce((a, b) => a + (b.upsell_total || 0), 0);
+  const fees = bookings.reduce((a, b) => a + (b.platform_fee || 0), 0);
+  const totalExpenses = expenses.reduce((a, e) => a + (e.amount || 0), 0);
+  const totalRevenue = gross + upsell;
+  const netProfit = +(totalRevenue - fees - totalExpenses).toFixed(2);
+  const margin = totalRevenue > 0 ? +(netProfit / totalRevenue).toFixed(3) : 0;
+  const byProperty = tableAll('properties').map(p => {
+    const bs = bookings.filter(b => b.property_id === p.id);
+    const rev = bs.reduce((a, b) => a + (b.amount || 0) + (b.upsell_total || 0), 0);
+    const fee = bs.reduce((a, b) => a + (b.platform_fee || 0), 0);
+    const exp = expenses.filter(e => e.property_id === p.id).reduce((a, e) => a + (e.amount || 0), 0);
+    const net = +(rev - fee - exp).toFixed(2);
+    return { id: p.id, nickname: p.nickname, revenue: +rev.toFixed(2), fees: +fee.toFixed(2), expenses: +exp.toFixed(2), net_profit: net, margin: rev > 0 ? +(net / rev).toFixed(3) : 0 };
+  }).sort((a, b) => b.net_profit - a.net_profit);
+  const byChannel = tableAll('booking_types').map(t => {
+    const bs = bookings.filter(b => b.booking_type_id === t.id);
+    const rev = bs.reduce((a, b) => a + (b.amount || 0) + (b.upsell_total || 0), 0);
+    const fee = bs.reduce((a, b) => a + (b.platform_fee || 0), 0);
+    return { type: t.name, fee_percent: Number(t.fee_percent) || 0, is_direct: t.is_direct ? 1 : 0, bookings: bs.length, revenue: +rev.toFixed(2), fees: +fee.toFixed(2), net: +(rev - fee).toFixed(2), effective_rate: rev > 0 ? +((rev - fee) / rev).toFixed(3) : 0 };
+  }).filter(c => c.bookings > 0).sort((a, b) => b.net - a.net);
+  const byCategory = {};
+  expenses.forEach(e => { const k = e.category || 'Other'; byCategory[k] = (byCategory[k] || 0) + (e.amount || 0); });
+  const expenseCategories = Object.entries(byCategory).map(([category, amount]) => ({ category, amount: +amount.toFixed(2) })).sort((a, b) => b.amount - a.amount);
+  const pnl = [];
+  for (let m = 0; m < 12; m++) {
+    const ms = `${year}-${String(m + 1).padStart(2, '0')}`;
+    const mb = bookings.filter(b => (b.check_in || '').slice(0, 7) === ms);
+    const rev = mb.reduce((a, b) => a + (b.amount || 0) + (b.upsell_total || 0), 0);
+    const fee = mb.reduce((a, b) => a + (b.platform_fee || 0), 0);
+    const exp = expenses.filter(e => (e.date || '').slice(0, 7) === ms).reduce((a, e) => a + (e.amount || 0), 0);
+    pnl.push({ month: m + 1, label: new Date(year, m, 1).toLocaleString('en-US', { month: 'short' }), revenue: +rev.toFixed(2), fees: +fee.toFixed(2), expenses: +exp.toFixed(2), net: +(rev - fee - exp).toFixed(2) });
+  }
+  const taxPct = Number(getSetting('tax_setaside_percent', 25)) || 0;
+  return {
+    year, total_revenue: +totalRevenue.toFixed(2), gross_booking_revenue: +gross.toFixed(2), ancillary_revenue: +upsell.toFixed(2),
+    platform_fees: +fees.toFixed(2), total_expenses: +totalExpenses.toFixed(2), net_profit: netProfit, margin,
+    tax_setaside_percent: taxPct, tax_setaside: +(netProfit * taxPct / 100).toFixed(2),
+    by_property: byProperty, by_channel: byChannel, expense_categories: expenseCategories, pnl_by_month: pnl,
+  };
+}
+function computeMetrics(year) {
+  const all = tableAll('bookings').map(joinBooking);
+  const yStart = `${year}-01-01`, yEnd = `${year}-12-31`;
+  const ytd = all.filter(b => b.check_in >= yStart && b.check_in <= yEnd);
+  const active = ytd.filter(b => b.status !== 'cancelled');
+  const leads = active.map(b => { if (!b.created_at || !b.check_in) return null; const d = Math.round((new Date(b.check_in) - new Date(b.created_at)) / 86400000); return d >= 0 ? d : null; }).filter(x => x != null);
+  const avgLead = leads.length ? Math.round(leads.reduce((a, x) => a + x, 0) / leads.length) : 0;
+  const los = active.map(b => (b.check_in && b.check_out) ? Math.max(1, Math.round((new Date(b.check_out) - new Date(b.check_in)) / 86400000)) : null).filter(x => x != null);
+  const avgLos = los.length ? +(los.reduce((a, x) => a + x, 0) / los.length).toFixed(1) : 0;
+  const cancelled = ytd.filter(b => b.status === 'cancelled').length;
+  const cancelRate = ytd.length ? +(cancelled / ytd.length).toFixed(3) : 0;
+  const byGuest = {}; all.forEach(b => { if (b.guest_id) byGuest[b.guest_id] = (byGuest[b.guest_id] || 0) + 1; });
+  const guestsWithBookings = Object.keys(byGuest).length;
+  const repeatGuests = Object.values(byGuest).filter(c => c > 1).length;
+  const repeatRate = guestsWithBookings ? +(repeatGuests / guestsWithBookings).toFixed(3) : 0;
+  const directCount = active.filter(b => b.booking_type_is_direct).length;
+  const directPct = active.length ? +(directCount / active.length).toFixed(3) : 0;
+  const reviews = tableAll('reviews');
+  const reviewCount = reviews.length;
+  const avgRating = reviewCount ? +(reviews.reduce((a, r) => a + (Number(r.rating) || 0), 0) / reviewCount).toFixed(2) : 0;
+  const cleaningExp = tableAll('expenses').filter(e => (e.date || '').slice(0, 4) === String(year) && /clean/i.test(e.category || '')).reduce((a, e) => a + (e.amount || 0), 0);
+  const costPerTurnover = active.length ? +(cleaningExp / active.length).toFixed(2) : 0;
+  const rev = y => all.filter(b => b.status !== 'cancelled' && (b.check_in || '').slice(0, 4) === String(y)).reduce((a, b) => a + (b.amount || 0) + (b.upsell_total || 0), 0);
+  const revThis = rev(year), revLast = rev(year - 1);
+  const yoy = revLast > 0 ? +(((revThis - revLast) / revLast)).toFixed(3) : null;
+  return { avg_lead_time_days: avgLead, avg_length_of_stay: avgLos, cancellation_rate: cancelRate, repeat_guest_rate: repeatRate, direct_booking_pct: directPct, review_count: reviewCount, avg_rating: avgRating, cost_per_turnover: costPerTurnover, yoy_revenue_change: yoy, revenue_this_year: +revThis.toFixed(2), revenue_last_year: +revLast.toFixed(2) };
+}
+app.get('/api/financials', (req, res) => {
+  const year = Number(req.query.year) || new Date().getFullYear();
+  ok(res, { ...computeFinancials(year), metrics: computeMetrics(year) });
+});
+
+// ---------- ORPHAN / GAP NIGHTS ----------
+function computeOrphans(maxGap) {
+  maxGap = maxGap || 2;
+  const today = new Date().toISOString().slice(0, 10);
+  const events = buildCalendarEvents().filter(e => ['booking', 'reserved', 'block'].includes(e.kind));
+  const byProp = {};
+  events.forEach(e => { if (!e.property_id || !e.start) return; (byProp[e.property_id] = byProp[e.property_id] || []).push({ start: e.start, end: effEnd(e.start, e.end) }); });
+  const out = [];
+  for (const pid of Object.keys(byProp)) {
+    const ivs = byProp[pid].sort((a, b) => a.start.localeCompare(b.start));
+    const merged = [];
+    for (const iv of ivs) { const last = merged[merged.length - 1]; if (last && iv.start <= last.end) { if (iv.end > last.end) last.end = iv.end; } else merged.push({ ...iv }); }
+    for (let i = 0; i < merged.length - 1; i++) {
+      const gapStart = merged[i].end, gapEnd = merged[i + 1].start;
+      if (gapEnd <= gapStart) continue;
+      const nights = Math.round((new Date(gapEnd) - new Date(gapStart)) / 86400000);
+      if (nights >= 1 && nights <= maxGap && gapEnd >= today) {
+        const p = tableFind('properties', Number(pid));
+        out.push({ property_id: Number(pid), property_name: p?.nickname || null, gap_start: gapStart, gap_end: gapEnd, nights });
+      }
+    }
+  }
+  return out.sort((a, b) => a.gap_start.localeCompare(b.gap_start));
+}
+app.get('/api/orphans', (req, res) => ok(res, computeOrphans(Number(req.query.max) || 2)));
+
+// ---------- GUEST MESSAGING ----------
+app.get('/api/message-templates', (req, res) => ok(res, tableAll('message_templates').sort((a, b) => (a.offset_days || 0) - (b.offset_days || 0))));
+app.put('/api/message-templates/:id', (req, res) => {
+  const b = req.body || {}; const patch = {};
+  ['subject', 'body', 'channel'].forEach(k => { if (b[k] != null) patch[k] = b[k]; });
+  if (b.enabled != null) patch.enabled = b.enabled ? 1 : 0;
+  if (b.offset_days != null) patch.offset_days = Number(b.offset_days) || 0;
+  if (b.send_hour != null) patch.send_hour = Number(b.send_hour) || 9;
+  const row = tableUpdate('message_templates', req.params.id, patch);
+  if (!row) return err(res, 404, 'not found'); ok(res, row);
+});
+function renderTemplate(body, b) {
+  const p = tableFind('properties', b.property_id) || {};
+  return (body || '')
+    .replace(/{guest}/g, b.guest_name || b.contact_name || 'there')
+    .replace(/{property}/g, b.property_name || p.nickname || 'our place')
+    .replace(/{checkin}/g, b.check_in || '')
+    .replace(/{checkout}/g, b.check_out || '')
+    .replace(/{door_code}/g, b.door_code || '(see lockbox)')
+    .replace(/{address}/g, p.address || '')
+    .replace(/{checkin_instructions}/g, p.check_in_instructions || '');
+}
+function anchorDate(stage, b) {
+  if (stage === 'confirmation') return (b.created_at || '').slice(0, 10) || b.check_in;
+  if (['pre_arrival', 'checkin_day', 'mid_stay'].includes(stage)) return b.check_in;
+  return b.check_out || b.check_in;
+}
+function computeScheduledMessages() {
+  const today = new Date().toISOString().slice(0, 10);
+  const templates = tableAll('message_templates').filter(t => t.enabled);
+  const out = [];
+  for (const b of tableAll('bookings').map(joinBooking)) {
+    if (b.status === 'cancelled') continue;
+    for (const t of templates) {
+      const anchor = anchorDate(t.stage, b); if (!anchor) continue;
+      const sendDate = addDays(anchor, Number(t.offset_days) || 0);
+      const sent = store.sms_messages.some(m => m.booking_id === b.id && m.stage === t.stage && m.direction === 'outbound');
+      out.push({
+        booking_id: b.id, stage: t.stage, send_date: sendDate, due: sendDate <= today, sent,
+        guest_name: b.guest_name || b.contact_name, property_name: b.property_name, guest_phone: b.guest_phone,
+        check_in: b.check_in, check_out: b.check_out, preview: renderTemplate(t.body, b),
+      });
+    }
+  }
+  return out.sort((a, b) => (a.send_date || '').localeCompare(b.send_date || ''));
+}
+app.get('/api/messages/scheduled', (req, res) => ok(res, computeScheduledMessages()));
+async function sendBookingStage(bookingId, stage) {
+  const raw = tableFind('bookings', bookingId); if (!raw) throw new Error('booking not found');
+  const b = joinBooking(raw);
+  const t = tableAll('message_templates').find(x => x.stage === stage); if (!t) throw new Error('template not found');
+  const body = renderTemplate(t.body, b);
+  if (!b.guest_phone) throw new Error('guest has no phone number');
+  if (!twilioClient) throw new Error('Twilio not configured');
+  const msg = await twilioClient.messages.create({ body, from: TWILIO_FROM, to: b.guest_phone });
+  tableInsert('sms_messages', { direction: 'outbound', from_number: TWILIO_FROM, to_number: b.guest_phone, body, twilio_sid: msg.sid, guest_id: b.guest_id || null, property_id: b.property_id || null, booking_id: b.id, stage, sent_at: nowIso() });
+  return { sid: msg.sid, body };
+}
+app.post('/api/messages/send', async (req, res) => {
+  const { booking_id, stage } = req.body || {};
+  if (!booking_id || !stage) return err(res, 400, 'booking_id and stage required');
+  try { ok(res, await sendBookingStage(Number(booking_id), stage)); }
+  catch (e) { err(res, 400, e.message); }
+});
+let schedulerRunning = false;
+async function runMessageScheduler() {
+  if (schedulerRunning) return; schedulerRunning = true;
+  try {
+    if (!getSetting('messaging_autosend_enabled', false) || !twilioClient) return;
+    const today = new Date().toISOString().slice(0, 10);
+    const cutoff = addDays(today, -1); // never fire messages whose date is more than ~1 day stale
+    const due = computeScheduledMessages().filter(m => m.due && !m.sent && m.guest_phone && m.send_date >= cutoff);
+    for (const m of due) { try { await sendBookingStage(m.booking_id, m.stage); } catch (e) { console.error('[scheduler] ' + m.booking_id + '/' + m.stage + ': ' + e.message); } }
+  } finally { schedulerRunning = false; }
+}
+
+// ---------- PRICELABS ----------
+const PRICELABS_KEY = process.env.PRICELABS_API_KEY || '';
+async function pricelabsGet(path) {
+  const r = await fetch('https://api.pricelabs.co/v1' + path, { headers: { 'X-API-Key': PRICELABS_KEY } });
+  if (!r.ok) throw new Error('PriceLabs ' + r.status);
+  return r.json();
+}
+async function pricelabsPrices(listingId, pms, datefrom, dateto) {
+  const r = await fetch('https://api.pricelabs.co/v1/listing_prices', {
+    method: 'POST', headers: { 'X-API-Key': PRICELABS_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ listings: [{ id: listingId, pms, datefrom, dateto }] }),
+  });
+  if (!r.ok) throw new Error('PriceLabs prices ' + r.status);
+  return r.json();
+}
+app.get('/api/pricelabs/listings', async (req, res) => {
+  if (!PRICELABS_KEY) return err(res, 503, 'PriceLabs API key not set');
+  try { const d = await pricelabsGet('/listings'); ok(res, d.listings || []); }
+  catch (e) { err(res, 502, e.message); }
+});
+app.post('/api/pricelabs/refresh', async (req, res) => {
+  if (!PRICELABS_KEY) return err(res, 503, 'PriceLabs API key not set');
+  const today = new Date().toISOString().slice(0, 10), to = addDays(today, 60);
+  const results = [];
+  for (const p of tableAll('properties')) {
+    if (!p.pricelabs_listing_id || !p.pricelabs_pms) continue;
+    try {
+      const data = await pricelabsPrices(p.pricelabs_listing_id, p.pricelabs_pms, today, to);
+      const arr = Array.isArray(data) ? data : (data.listings || []);
+      const days = (arr[0] && arr[0].data) || [];
+      const currency = (arr[0] && arr[0].currency) || 'CAD';
+      store.price_cache = store.price_cache.filter(c => c.property_id !== p.id);
+      enqueueWrite(async () => { const { error } = await supabase.from(tbl('price_cache')).delete().eq('property_id', p.id); if (error) throw error; }, 'clear price_cache ' + p.id);
+      for (const d of days) tableInsert('price_cache', { property_id: p.id, date: d.date, recommended_price: d.price, user_price: d.user_price, min_stay: d.min_stay, demand: d.demand_desc, currency, fetched_at: nowIso() });
+      results.push({ property_id: p.id, nickname: p.nickname, days: days.length });
+    } catch (e) { results.push({ property_id: p.id, nickname: p.nickname, error: e.message }); }
+  }
+  ok(res, results);
+});
+app.get('/api/pricing', async (req, res) => {
+  let listings = [], listErr = null;
+  if (PRICELABS_KEY) { try { const d = await pricelabsGet('/listings'); listings = d.listings || []; } catch (e) { listErr = e.message; } }
+  const byId = {}; listings.forEach(l => { byId[l.id] = l; });
+  const props = tableAll('properties').map(p => {
+    const l = p.pricelabs_listing_id ? byId[p.pricelabs_listing_id] : null;
+    const prices = store.price_cache.filter(c => c.property_id === p.id).sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+    return {
+      property_id: p.id, nickname: p.nickname, pricelabs_listing_id: p.pricelabs_listing_id || null, pricelabs_pms: p.pricelabs_pms || null,
+      summary: l ? { recommended_base_price: l.recommended_base_price, min: l.min, base: l.base, max: l.max, occupancy_next_7: l.occupancy_next_7, market_occupancy_next_7: l.market_occupancy_next_7, occupancy_next_30: l.occupancy_next_30, market_occupancy_next_30: l.market_occupancy_next_30, occupancy_next_60: l.occupancy_next_60, market_occupancy_next_60: l.market_occupancy_next_60 } : null,
+      prices,
+    };
+  });
+  ok(res, { listings_error: listErr, listings: listings.map(l => ({ id: l.id, pms: l.pms, name: l.name })), properties: props });
+});
+
+// ---------- CRON (Vercel-scheduled message sender) ----------
+// On serverless there's no long-lived timer, so Vercel Cron pings this hourly.
+app.get('/api/cron/scheduler', async (req, res) => {
+  const secret = process.env.CRON_SECRET || '';
+  const provided = req.query.secret || (req.headers.authorization || '').replace(/^Bearer\s+/, '');
+  if (secret && provided !== secret) return err(res, 403, 'forbidden');
+  await runMessageScheduler(); // runs inside the request snapshot context; writes flush on response
+  ok(res, { ran: true });
+});
+
+// ---------- 404 fallback for /api ----------
+app.use('/api', (req, res) => err(res, 404, 'not found'));
+
+// Export the Express app so Vercel's @vercel/node can use it as a serverless function.
+module.exports = app;
+
+// Run a standalone server only when invoked directly (local dev / always-on host).
+if (require.main === module) {
+  (async () => {
+    try {
+      await withContext(seedDefaults); // idempotent: seed defaults if missing
+      console.log('[startup] Supabase connected (' + SUPABASE_URL + ')');
+    } catch (e) {
+      console.error('[startup] Supabase check failed:', e.message || e);
+      process.exit(1);
+    }
+    app.listen(PORT, () => console.log(`[startup] Short-Term Rental Tracker listening on http://localhost:${PORT}`));
+    // Local-only scheduler (serverless uses /api/cron/scheduler instead). Sends only when enabled.
+    setInterval(() => { withContext(runMessageScheduler).catch(e => console.error('[scheduler]', e.message)); }, 60 * 60 * 1000);
+  })();
+}
