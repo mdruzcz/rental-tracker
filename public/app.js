@@ -208,6 +208,23 @@
     sendMessage: (b) => api('POST', '/api/messages/send', b),
     pricelabs: { listings: () => api('GET', '/api/pricelabs/listings'), refresh: () => api('POST', '/api/pricelabs/refresh') },
     pricing: () => api('GET', '/api/pricing'),
+    ltr: {
+      overview: () => api('GET', '/api/ltr'),
+      updateListing: (id, b) => api('PUT', `/api/properties/${id}/ltr`, b),
+      uploadPhotos: async (id, formData) => {
+        const token = await Auth.token();
+        const r = await fetch(`/api/properties/${id}/ltr-photos`, { method: 'POST', headers: token ? { Authorization: 'Bearer ' + token } : {}, body: formData });
+        if (!r.ok) { let m = 'upload failed'; try { m = (await r.json()).error || m; } catch (e) {} toast(m, 'error'); throw new Error(m); }
+        return r.json();
+      },
+      deletePhoto: (id, p) => api('DELETE', `/api/properties/${id}/ltr-photo?path=${encodeURIComponent(p)}`),
+    },
+    ltrApplicants: {
+      list: (pid) => api('GET', '/api/ltr-applicants' + (pid ? '?property_id=' + pid : '')),
+      create: (b) => api('POST', '/api/ltr-applicants', b),
+      update: (id, b) => api('PUT', `/api/ltr-applicants/${id}`, b),
+      remove: (id) => api('DELETE', `/api/ltr-applicants/${id}`),
+    },
     dashboard: () => api('GET', '/api/dashboard'),
     mailingList: () => api('GET', '/api/mailing-list'),
     notifyGuest: (bookingId, body) => api('POST', `/api/bookings/${bookingId}/notify-guest`, body || {}),
@@ -2845,6 +2862,158 @@ Matt`;
       root.appendChild(card);
     });
   };
+
+  // ---------- LONG-TERM RENTAL ----------
+  const LTR_STATUS = [{ value: 'applied', label: 'Applied' }, { value: 'screening', label: 'Screening' }, { value: 'approved', label: 'Approved' }, { value: 'secured', label: 'Secured (signed)' }, { value: 'rejected', label: 'Rejected' }];
+  VIEWS.ltr = async (root) => {
+    const data = await API.ltr.overview();
+    const props = data.properties;
+    const applyUrl = location.origin + '/apply';
+    root.appendChild(el('div', { class: 'between' }, el('h1', null, 'Long-Term Rental'),
+      el('div', { class: 'btn-row' },
+        el('button', { class: 'btn-ghost', onclick: () => { navigator.clipboard && navigator.clipboard.writeText(applyUrl); toast('Application link copied', 'success'); } }, '🔗 Copy application link'),
+        el('button', { class: 'btn-ghost', onclick: () => window.open('/apply', '_blank') }, 'Preview →'),
+        el('button', { class: 'btn-primary', onclick: () => applicantForm(null, props) }, '+ Add applicant'))));
+    root.appendChild(el('div', { class: 'muted', style: 'margin-bottom:12px;' }, 'Off-season tenancy (Oct–June). Share the application link on Facebook Marketplace; applications appear below. Click a property to edit its listing.'));
+
+    // At-a-glance status
+    const grid = el('div', { class: 'kpi-grid' });
+    props.forEach(p => {
+      const secured = p.ltr_status === 'secured';
+      const statusTxt = secured ? 'Tenant secured' : (p.ltr_listed ? 'Vacant — listed' : 'Not listed');
+      const card = el('div', { class: 'kpi', style: 'cursor:pointer;', onclick: () => ltrListingForm(p, data.applicants.filter(a => a.property_id === p.id)) });
+      card.appendChild(el('div', { class: 'label' }, p.nickname));
+      card.appendChild(el('div', { class: 'value', style: 'font-size:17px;color:' + (secured ? 'var(--danger)' : (p.ltr_listed ? 'var(--success)' : 'var(--muted)')) }, statusTxt));
+      card.appendChild(el('div', { class: 'sub' }, (p.ltr_rent ? fmtMoney(p.ltr_rent) + '/mo · ' : '') + p.applicant_count + ' applicant' + (p.applicant_count === 1 ? '' : 's') + (p.secured_tenant_name ? ' · ' + p.secured_tenant_name : '')));
+      grid.appendChild(card);
+    });
+    root.appendChild(grid);
+
+    // Applicants table
+    const card = el('div', { class: 'card' });
+    card.appendChild(el('h2', null, 'Applicants'));
+    if (!data.applicants.length) card.appendChild(el('div', { class: 'empty' }, 'No applicants yet. Share the application link to start receiving them.'));
+    else {
+      const tbl = el('table');
+      tbl.appendChild(el('thead', null, el('tr', null,
+        el('th', null, 'Name'), el('th', null, 'Property'), el('th', { class: 'num' }, 'Income'), el('th', { class: 'num' }, 'Credit'), el('th', null, 'Move-in'), el('th', null, 'Status'), el('th', null, ''))));
+      const tb = el('tbody');
+      data.applicants.forEach(a => tb.appendChild(el('tr', null,
+        el('td', null, el('strong', null, a.name || '—'), a.email ? el('div', { class: 'muted', style: 'font-size:11px;' }, a.email) : null),
+        el('td', null, a.property_name || '—'),
+        el('td', { class: 'num' }, a.annual_income ? fmtMoney(a.annual_income) : '—'),
+        el('td', { class: 'num' }, a.credit_score || '—'),
+        el('td', null, a.desired_move_in || '—'),
+        el('td', null, el('span', { class: 'badge ' + (a.status === 'secured' || a.status === 'approved' ? 'success' : (a.status === 'rejected' ? '' : 'warning')) }, a.status || 'applied')),
+        el('td', null, el('div', { class: 'btn-row' },
+          el('button', { class: 'btn-ghost small', onclick: () => applicantForm(a, props) }, 'View'),
+          el('button', { class: 'btn-danger small', onclick: async () => { if (confirm('Delete applicant?')) { await API.ltrApplicants.remove(a.id); setView('ltr'); } } }, '×'))))));
+      tbl.appendChild(tb); card.appendChild(tbl);
+    }
+    root.appendChild(card);
+  };
+
+  function ltrListingForm(p, applicants) {
+    const form = el('form', { class: 'form-grid' });
+    const listed = el('input', { type: 'checkbox', style: 'width:auto;' }); listed.checked = !!p.ltr_listed;
+    form.appendChild(el('label', { style: 'grid-column:1/-1;display:flex;gap:8px;align-items:center;' }, listed, 'Listed for long-term rental (shows on the public application page)'));
+    form.appendChild(formField('Status', select('ltr_status', [{ value: 'vacant', label: 'Vacant' }, { value: 'secured', label: 'Tenant secured' }], p.ltr_status || 'vacant')));
+    form.appendChild(formField('Monthly rent ($)', input('ltr_rent', { type: 'number', value: p.ltr_rent || '' })));
+    form.appendChild(formField('Available from', input('ltr_available_date', { type: 'date', value: p.ltr_available_date })));
+    const securedOpts = [{ value: '', label: '— none —' }].concat((applicants || []).map(a => ({ value: String(a.id), label: a.name + (a.credit_score ? ' (credit ' + a.credit_score + ')' : '') })));
+    form.appendChild(formField('Secured tenant', select('ltr_secured_applicant_id', securedOpts, p.ltr_secured_applicant_id || '')));
+    form.appendChild(formField('Description (for Facebook Marketplace)', textarea('ltr_description', p.ltr_description, { rows: 5, placeholder: 'Beautiful 2-bed cottage on the lake, fully furnished, available October to May…' }), { full: true }));
+    form.appendChild(formField('Lease terms / details', textarea('ltr_lease_terms', p.ltr_lease_terms, { rows: 3, placeholder: 'e.g. 8-month lease Oct–May, $X deposit, utilities included, no smoking, pets negotiable' }), { full: true }));
+
+    // Photos
+    const photoWrap = el('div', { style: 'grid-column:1/-1;' }, el('strong', null, 'Photos'));
+    const list = el('div', { class: 'lic-file-list', style: 'display:flex;gap:8px;flex-wrap:wrap;margin:6px 0;' });
+    (p.ltr_photos || []).forEach(ph => {
+      const cell = el('div', { style: 'position:relative;' });
+      if (ph.url) cell.appendChild(el('img', { src: ph.url, style: 'width:110px;height:82px;object-fit:cover;border-radius:6px;border:1px solid var(--border);' }));
+      cell.appendChild(el('button', { class: 'btn-danger small', type: 'button', style: 'position:absolute;top:2px;right:2px;', onclick: async () => { await API.ltr.deletePhoto(p.id, ph.path); ltrListingForm({ ...p, ltr_photos: (p.ltr_photos || []).filter(x => x.path !== ph.path) }, applicants); } }, '×'));
+      list.appendChild(cell);
+    });
+    photoWrap.appendChild(list);
+    const fileInput = el('input', { type: 'file', multiple: true, accept: 'image/*', style: 'display:none;' });
+    fileInput.addEventListener('change', async () => {
+      if (!fileInput.files.length) return;
+      const fd = new FormData(); for (const f of fileInput.files) fd.append('files', f);
+      try { const updated = await API.ltr.uploadPhotos(p.id, fd); toast('Photos uploaded', 'success'); ltrListingForm(updated, applicants); } catch (e) {}
+    });
+    photoWrap.appendChild(el('button', { class: 'btn-ghost', type: 'button', onclick: () => fileInput.click() }, '+ Upload photos'));
+    photoWrap.appendChild(fileInput);
+    form.appendChild(photoWrap);
+
+    form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;flex-wrap:wrap;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, 'Save listing'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: () => copyListing(p) }, '📋 Copy listing text'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: () => { navigator.clipboard && navigator.clipboard.writeText(location.origin + '/apply?property=' + p.id); toast('Apply link copied', 'success'); } }, '🔗 Apply link'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault(); const d = readForm(form);
+      try {
+        await API.ltr.updateListing(p.id, {
+          ltr_listed: listed.checked ? 1 : 0, ltr_status: d.ltr_status, ltr_rent: Number(d.ltr_rent) || 0,
+          ltr_available_date: d.ltr_available_date || '', ltr_description: d.ltr_description, ltr_lease_terms: d.ltr_lease_terms,
+          ltr_secured_applicant_id: d.ltr_secured_applicant_id || null,
+        });
+        toast('Listing saved', 'success'); closeModal(); setView('ltr');
+      } catch (e) {}
+    });
+    openModal('Listing — ' + p.nickname, form);
+  }
+  function copyListing(p) {
+    const parts = [p.nickname];
+    if (p.ltr_rent) parts.push(fmtMoney(p.ltr_rent) + '/month');
+    if (p.ltr_available_date) parts.push('Available from ' + p.ltr_available_date);
+    if (p.ltr_description) parts.push('\n' + p.ltr_description);
+    if (p.ltr_lease_terms) parts.push('\nTerms: ' + p.ltr_lease_terms);
+    parts.push('\nApply here: ' + location.origin + '/apply?property=' + p.id);
+    navigator.clipboard && navigator.clipboard.writeText(parts.join('\n'));
+    toast('Listing copied — paste into Facebook Marketplace', 'success');
+  }
+  function applicantForm(a, props) {
+    const form = el('form', { class: 'form-grid' });
+    const propOpts = [{ value: '', label: '— general / unassigned —' }].concat(props.map(p => ({ value: String(p.id), label: p.nickname })));
+    form.appendChild(formField('Property', select('property_id', propOpts, a?.property_id || '')));
+    form.appendChild(formField('Status', select('status', LTR_STATUS, a?.status || 'applied')));
+    form.appendChild(formField('Name *', input('name', { value: a?.name, required: true })));
+    form.appendChild(formField('Email', input('email', { type: 'email', value: a?.email })));
+    form.appendChild(formField('Phone', input('phone', { value: a?.phone })));
+    form.appendChild(formField('Desired move-in', input('desired_move_in', { type: 'date', value: a?.desired_move_in })));
+    form.appendChild(formField('Annual income ($)', input('annual_income', { type: 'number', value: a?.annual_income || '' })));
+    form.appendChild(formField('Credit score', input('credit_score', { type: 'number', value: a?.credit_score || '' })));
+    form.appendChild(formField('Occupants', input('occupants', { type: 'number', value: a?.occupants || '' })));
+    form.appendChild(formField('Pets', input('pets', { value: a?.pets })));
+    form.appendChild(formField('Employer', input('employer', { value: a?.employer })));
+    form.appendChild(formField('Job title', input('job_title', { value: a?.job_title })));
+    form.appendChild(formField('Current address', input('current_address', { value: a?.current_address }), { full: true }));
+    form.appendChild(formField('References', textarea('references_info', a?.references_info), { full: true }));
+    form.appendChild(formField('Notes', textarea('notes', a?.notes), { full: true }));
+    const btns = el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, a ? 'Save' : 'Add applicant'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel'));
+    if (a && a.property_id) {
+      btns.appendChild(el('button', { class: 'btn-ghost', type: 'button', style: 'margin-left:auto;', onclick: async () => {
+        await API.ltrApplicants.update(a.id, { status: 'secured' });
+        await API.ltr.updateListing(a.property_id, { ltr_status: 'secured', ltr_secured_applicant_id: a.id });
+        toast('Marked as secured tenant', 'success'); closeModal(); setView('ltr');
+      } }, '✓ Set as secured tenant'));
+    }
+    form.appendChild(btns);
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault(); const d = readForm(form);
+      const payload = {
+        property_id: d.property_id || null, status: d.status, name: d.name, email: d.email, phone: d.phone,
+        desired_move_in: d.desired_move_in, annual_income: Number(d.annual_income) || 0, credit_score: Number(d.credit_score) || 0,
+        occupants: Number(d.occupants) || 0, pets: d.pets, employer: d.employer, job_title: d.job_title,
+        current_address: d.current_address, references_info: d.references_info, notes: d.notes,
+      };
+      try { if (a) await API.ltrApplicants.update(a.id, payload); else await API.ltrApplicants.create(payload); toast('Saved', 'success'); closeModal(); setView('ltr'); } catch (e) {}
+    });
+    openModal(a ? 'Applicant — ' + (a.name || '') : 'Add applicant', form);
+  }
 
   // ---------- LOGIN GATE + BOOT ----------
   function showLogin(message) {

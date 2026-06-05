@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rental Application</title>
+  <style>
+    :root { --bg:#f3f1ec; --surface:#fff; --border:#e4dfd5; --text:#2b2a26; --muted:#847f73; --accent:#3f6e7d; --accent-hover:#335a67; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); line-height:1.5; }
+    .wrap { max-width:820px; margin:0 auto; padding:24px 16px 64px; }
+    h1 { font-size:24px; margin:8px 0; }
+    h2 { font-size:18px; margin:24px 0 8px; }
+    .muted { color:var(--muted); }
+    .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px; margin-bottom:16px; box-shadow:0 1px 2px rgba(40,38,32,.05); }
+    .listing { display:flex; gap:14px; flex-wrap:wrap; }
+    .listing img { width:140px; height:104px; object-fit:cover; border-radius:8px; }
+    .listing .body { flex:1; min-width:200px; }
+    .pill { display:inline-block; font-size:11px; font-weight:700; padding:2px 8px; border-radius:10px; }
+    .pill.vacant { background:#dcfce7; color:#166534; }
+    .pill.secured { background:#fee2e2; color:#b91c1c; }
+    label { display:block; margin:10px 0 0; font-size:13px; font-weight:600; }
+    input, select, textarea { width:100%; padding:9px 11px; border:1px solid var(--border); border-radius:7px; font-size:15px; font-family:inherit; margin-top:4px; background:#fff; }
+    .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:0 14px; }
+    @media (max-width:560px){ .grid2 { grid-template-columns:1fr; } }
+    button { background:var(--accent); color:#fff; border:none; border-radius:8px; padding:12px 18px; font-size:16px; font-weight:600; cursor:pointer; margin-top:18px; }
+    button:hover { background:var(--accent-hover); }
+    .ok { background:#dcfce7; border:1px solid #a7f3d0; color:#166534; padding:14px; border-radius:8px; }
+    .err { color:#b91c1c; font-size:14px; min-height:18px; margin-top:8px; }
+    .photos { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+    .photos img { width:90px; height:68px; object-fit:cover; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Rental Application</h1>
+    <p class="muted">Apply for one of our long-term rentals. We'll review your application and get back to you.</p>
+
+    <h2>Available rentals</h2>
+    <div id="listings"><p class="muted">Loading…</p></div>
+
+    <div class="card" id="formCard">
+      <h2 style="margin-top:0;">Your application</h2>
+      <form id="form">
+        <label>Applying for *</label>
+        <select name="property_id" id="propSel" required></select>
+        <div class="grid2">
+          <div><label>Full name *</label><input name="name" required /></div>
+          <div><label>Email *</label><input name="email" type="email" required /></div>
+          <div><label>Phone</label><input name="phone" /></div>
+          <div><label>Desired move-in date</label><input name="desired_move_in" type="date" /></div>
+          <div><label>Current address</label><input name="current_address" /></div>
+          <div><label>Number of occupants</label><input name="occupants" type="number" min="1" /></div>
+          <div><label>Employer</label><input name="employer" /></div>
+          <div><label>Job title</label><input name="job_title" /></div>
+          <div><label>Annual income ($)</label><input name="annual_income" type="number" /></div>
+          <div><label>Credit score</label><input name="credit_score" type="number" min="300" max="900" /></div>
+        </div>
+        <label>Pets</label>
+        <input name="pets" placeholder="e.g. 1 small dog, none" />
+        <label>References</label>
+        <textarea name="references_info" rows="2" placeholder="Previous landlord name + phone, etc."></textarea>
+        <label>Anything else you'd like us to know?</label>
+        <textarea name="notes" rows="3"></textarea>
+        <div class="err" id="err"></div>
+        <button type="submit" id="submitBtn">Submit application</button>
+      </form>
+      <div id="thanks" style="display:none;" class="ok">✅ Thank you! Your application has been received. We'll be in touch soon.</div>
+    </div>
+  </div>
+
+  <script>
+    const fmtMoney = n => n ? '$' + Number(n).toLocaleString() : '';
+    async function load() {
+      const listings = await fetch('/api/public/ltr-listings').then(r => r.json()).catch(() => []);
+      const wrap = document.getElementById('listings');
+      const sel = document.getElementById('propSel');
+      sel.innerHTML = '';
+      if (!listings.length) {
+        wrap.innerHTML = '<p class="muted">No rentals are currently listed. Please check back soon.</p>';
+        document.getElementById('formCard').style.display = 'none';
+        return;
+      }
+      wrap.innerHTML = '';
+      listings.forEach(p => {
+        const card = document.createElement('div'); card.className = 'card';
+        const photos = (p.ltr_photos || []).filter(ph => ph.url);
+        const hero = photos[0] ? `<img src="${photos[0].url}" alt="">` : '';
+        const statusPill = p.ltr_status === 'secured' ? '<span class="pill secured">Rented</span>' : '<span class="pill vacant">Available</span>';
+        card.innerHTML = `<div class="listing">${hero}<div class="body">
+          <h2 style="margin:0 0 4px;">${escapeHtml(p.nickname)} ${statusPill}</h2>
+          <div class="muted">${escapeHtml(p.address || '')}</div>
+          <div style="margin:6px 0;"><strong>${fmtMoney(p.ltr_rent)}${p.ltr_rent ? '/mo' : ''}</strong>${p.ltr_available_date ? ' · available ' + escapeHtml(p.ltr_available_date) : ''}</div>
+          <div>${escapeHtml(p.ltr_description || '').replace(/\n/g,'<br>')}</div>
+          ${p.ltr_lease_terms ? '<div class="muted" style="margin-top:6px;"><strong>Terms:</strong> ' + escapeHtml(p.ltr_lease_terms) + '</div>' : ''}
+        </div></div>
+        ${photos.length > 1 ? '<div class="photos">' + photos.slice(1).map(ph => `<img src="${ph.url}" alt="">`).join('') + '</div>' : ''}`;
+        wrap.appendChild(card);
+        const opt = document.createElement('option'); opt.value = p.id; opt.textContent = p.nickname + (p.ltr_rent ? ' — ' + fmtMoney(p.ltr_rent) + '/mo' : '');
+        sel.appendChild(opt);
+      });
+      const pre = new URLSearchParams(location.search).get('property');
+      if (pre) sel.value = pre;
+    }
+    function escapeHtml(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+    document.getElementById('form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const err = document.getElementById('err'); err.textContent = '';
+      const btn = document.getElementById('submitBtn'); btn.disabled = true; btn.textContent = 'Submitting…';
+      const data = {}; new FormData(e.target).forEach((v, k) => data[k] = v);
+      try {
+        const r = await fetch('/api/public/ltr-applications', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Submission failed');
+        e.target.style.display = 'none';
+        document.getElementById('thanks').style.display = 'block';
+      } catch (ex) { err.textContent = ex.message; btn.disabled = false; btn.textContent = 'Submit application'; }
+    });
+    load();
+  </script>
+</body>
+</html>

@@ -73,11 +73,11 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || SUPABASE_SERVICE_ROLE_KEY.sta
 }
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
-const TABLE_KEYS = ['properties','booking_types','guests','cleaners','bookings','maintenance_items','synced_events','cleaner_tasks','booking_requests','todos','licensing_items','sms_messages','manual_blocks','expenses','upsells','booking_upsells','reviews','message_templates','settings','price_cache'];
+const TABLE_KEYS = ['properties','booking_types','guests','cleaners','bookings','maintenance_items','synced_events','cleaner_tasks','booking_requests','todos','licensing_items','sms_messages','manual_blocks','expenses','upsells','booking_upsells','reviews','message_templates','settings','price_cache','ltr_applicants'];
 const tbl = k => 'rental_' + k;
 // Whitelisted columns per table — strips any computed/extra props before writing to Postgres.
 const COLS = {
-  properties: ['id','created_at','nickname','address','airbnb_ical_url','vrbo_ical_url','notes','welcome_message','default_cleaner_id','public_bookable','license_status','license_renewal_date','check_in_instructions','nearby_attractions','contact_info','pricelabs_listing_id','pricelabs_pms','ical_token'],
+  properties: ['id','created_at','nickname','address','airbnb_ical_url','vrbo_ical_url','notes','welcome_message','default_cleaner_id','public_bookable','license_status','license_renewal_date','check_in_instructions','nearby_attractions','contact_info','pricelabs_listing_id','pricelabs_pms','ical_token','ltr_listed','ltr_status','ltr_description','ltr_rent','ltr_available_date','ltr_lease_terms','ltr_photos','ltr_secured_applicant_id'],
   booking_types: ['id','created_at','name','fee_percent','is_direct','fee_fixed'],
   guests: ['id','created_at','name','email','phone','address','notes'],
   cleaners: ['id','created_at','name','phone','email','rate','notes'],
@@ -97,6 +97,7 @@ const COLS = {
   message_templates: ['id','created_at','stage','channel','subject','body','enabled','offset_days','send_hour'],
   settings: ['id','created_at','key','value'],
   price_cache: ['id','created_at','property_id','date','recommended_price','user_price','min_stay','demand','currency','fetched_at'],
+  ltr_applicants: ['id','created_at','property_id','name','email','phone','current_address','employer','job_title','annual_income','credit_score','occupants','pets','desired_move_in','references_info','notes','status'],
 };
 function pickCols(table, row) {
   const allow = COLS[table]; if (!allow) return row;
@@ -116,6 +117,7 @@ const NUMERIC = {
   bookings: ['amount'], cleaners: ['rate'], expenses: ['amount'], upsells: ['default_price'],
   booking_upsells: ['price', 'qty'], reviews: ['rating'], booking_types: ['fee_percent', 'fee_fixed'],
   price_cache: ['recommended_price', 'user_price'],
+  properties: ['ltr_rent'], ltr_applicants: ['annual_income', 'credit_score'],
 };
 async function loadSnapshot() {
   const snap = { next_id: {} };
@@ -1204,6 +1206,118 @@ app.get('/api/public/ical/:pid.ics', (req, res) => {
   res.set('Content-Disposition', 'inline; filename="' + slugForFile(property.nickname) + '.ics"');
   res.send(buildPropertyIcs(property));
 });
+
+// ---------- LONG-TERM RENTAL (off-season tenancy: listings, photos, applicants) ----------
+async function signLtrPhotos(props) {
+  const paths = [];
+  props.forEach(p => (p.ltr_photos || []).forEach(ph => { if (ph.path) paths.push(ph.path); }));
+  if (!paths.length) return props;
+  const { data } = await supabase.storage.from(UPLOAD_BUCKET).createSignedUrls(paths, 3600);
+  const byPath = {}; (data || []).forEach(s => { if (s.path) byPath[s.path] = s.signedUrl; });
+  props.forEach(p => { p.ltr_photos = (p.ltr_photos || []).map(ph => ({ ...ph, url: ph.path ? byPath[ph.path] || null : ph.url || null })); });
+  return props;
+}
+function joinApplicant(a) { const p = a.property_id ? tableFind('properties', a.property_id) : null; return { ...a, property_name: p?.nickname || null }; }
+function createApplicant(b, source) {
+  return tableInsert('ltr_applicants', {
+    property_id: b.property_id ? Number(b.property_id) : null,
+    name: b.name || '', email: b.email || '', phone: b.phone || '',
+    current_address: b.current_address || '', employer: b.employer || '', job_title: b.job_title || '',
+    annual_income: Number(b.annual_income) || 0, credit_score: Number(b.credit_score) || 0,
+    occupants: Number(b.occupants) || 0, pets: b.pets || '', desired_move_in: b.desired_move_in || '',
+    references_info: b.references_info || '', notes: b.notes || '',
+    status: source === 'manual' ? (b.status || 'applied') : 'applied',
+  });
+}
+
+// Admin overview: each property's LTR listing + signed photos + applicant count + secured tenant.
+app.get('/api/ltr', async (req, res) => {
+  const props = tableAll('properties').map(p => {
+    const secured = p.ltr_secured_applicant_id ? tableFind('ltr_applicants', p.ltr_secured_applicant_id) : null;
+    return {
+      id: p.id, nickname: p.nickname, address: p.address,
+      ltr_listed: p.ltr_listed || 0, ltr_status: p.ltr_status || 'vacant',
+      ltr_description: p.ltr_description || '', ltr_rent: p.ltr_rent, ltr_available_date: p.ltr_available_date || '',
+      ltr_lease_terms: p.ltr_lease_terms || '', ltr_photos: (p.ltr_photos || []).slice(),
+      ltr_secured_applicant_id: p.ltr_secured_applicant_id || null,
+      secured_tenant_name: secured ? secured.name : null,
+      applicant_count: tableAll('ltr_applicants').filter(a => a.property_id === p.id).length,
+    };
+  });
+  await signLtrPhotos(props);
+  ok(res, { properties: props, applicants: tableAll('ltr_applicants').map(joinApplicant).sort((a, b) => (b.created_at || '').localeCompare(a.created_at || '')) });
+});
+app.put('/api/properties/:id/ltr', (req, res) => {
+  const b = req.body || {}; const patch = {};
+  ['ltr_status', 'ltr_description', 'ltr_available_date', 'ltr_lease_terms'].forEach(k => { if (b[k] != null) patch[k] = b[k]; });
+  if (b.ltr_listed != null) patch.ltr_listed = b.ltr_listed ? 1 : 0;
+  if (b.ltr_rent != null) patch.ltr_rent = Number(b.ltr_rent) || 0;
+  if (b.ltr_secured_applicant_id !== undefined) patch.ltr_secured_applicant_id = b.ltr_secured_applicant_id ? Number(b.ltr_secured_applicant_id) : null;
+  const row = tableUpdate('properties', req.params.id, patch);
+  if (!row) return err(res, 404, 'not found'); ok(res, row);
+});
+app.post('/api/properties/:id/ltr-photos', upload.array('files', 12), async (req, res) => {
+  const p = tableFind('properties', req.params.id);
+  if (!p) return err(res, 404, 'property not found');
+  if (!req.files || !req.files.length) return err(res, 400, 'no files uploaded');
+  const ts = Date.now(); const added = [];
+  for (let i = 0; i < req.files.length; i++) {
+    const f = req.files[i];
+    const ext = path.extname(f.originalname);
+    const base = path.basename(f.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40);
+    const objectPath = `ltr/${p.id}/${ts}-${i}-${base}${ext}`;
+    const up = await supabase.storage.from(UPLOAD_BUCKET).upload(objectPath, f.buffer, { contentType: f.mimetype, upsert: false });
+    if (up.error) return err(res, 500, 'upload failed: ' + up.error.message);
+    added.push({ path: objectPath, original_name: f.originalname });
+  }
+  const updated = tableUpdate('properties', p.id, { ltr_photos: [...(p.ltr_photos || []), ...added] });
+  const out = [updated]; await signLtrPhotos(out); ok(res, out[0]);
+});
+app.delete('/api/properties/:id/ltr-photo', async (req, res) => {
+  const p = tableFind('properties', req.params.id);
+  if (!p) return err(res, 404, 'property not found');
+  const objectPath = req.query.path || (req.body && req.body.path);
+  if (!objectPath) return err(res, 400, 'path required');
+  try { await supabase.storage.from(UPLOAD_BUCKET).remove([objectPath]); } catch (e) {}
+  const updated = tableUpdate('properties', p.id, { ltr_photos: (p.ltr_photos || []).filter(ph => ph.path !== objectPath) });
+  const out = [updated]; await signLtrPhotos(out); ok(res, out[0]);
+});
+app.get('/api/ltr-applicants', (req, res) => {
+  let rows = tableAll('ltr_applicants');
+  if (req.query.property_id) rows = rows.filter(a => String(a.property_id) === String(req.query.property_id));
+  ok(res, rows.map(joinApplicant).sort((a, b) => (b.created_at || '').localeCompare(a.created_at || '')));
+});
+app.post('/api/ltr-applicants', (req, res) => ok(res, joinApplicant(createApplicant(req.body || {}, 'manual'))));
+app.put('/api/ltr-applicants/:id', (req, res) => {
+  const b = req.body || {}; const patch = {};
+  ['name', 'email', 'phone', 'current_address', 'employer', 'job_title', 'pets', 'desired_move_in', 'references_info', 'notes', 'status'].forEach(k => { if (b[k] != null) patch[k] = b[k]; });
+  if (b.annual_income != null) patch.annual_income = Number(b.annual_income) || 0;
+  if (b.credit_score != null) patch.credit_score = Number(b.credit_score) || 0;
+  if (b.occupants != null) patch.occupants = Number(b.occupants) || 0;
+  if (b.property_id !== undefined) patch.property_id = b.property_id ? Number(b.property_id) : null;
+  const row = tableUpdate('ltr_applicants', req.params.id, patch);
+  if (!row) return err(res, 404, 'not found'); ok(res, joinApplicant(row));
+});
+app.delete('/api/ltr-applicants/:id', (req, res) => { tableRemove('ltr_applicants', req.params.id); ok(res, { ok: true }); });
+
+// Public application page data + submission (no login).
+app.get('/api/public/ltr-listings', async (req, res) => {
+  const props = tableAll('properties').filter(p => p.ltr_listed).map(p => ({
+    id: p.id, nickname: p.nickname, address: p.address, ltr_status: p.ltr_status || 'vacant',
+    ltr_description: p.ltr_description || '', ltr_rent: p.ltr_rent, ltr_available_date: p.ltr_available_date || '',
+    ltr_lease_terms: p.ltr_lease_terms || '', ltr_photos: (p.ltr_photos || []).slice(),
+  }));
+  await signLtrPhotos(props);
+  ok(res, props);
+});
+app.post('/api/public/ltr-applications', (req, res) => {
+  const b = req.body || {};
+  if (!b.name || !b.email) return err(res, 400, 'name and email are required');
+  const row = createApplicant(b, 'public');
+  ok(res, { ok: true, id: row.id });
+});
+// Public application page (no auth).
+app.get('/apply', (req, res) => res.sendFile(path.join(__dirname, 'public', 'apply.html')));
 
 // ---------- DASHBOARD ----------
 function daysBetween(a, b) {
