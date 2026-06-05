@@ -654,6 +654,14 @@
     form.appendChild(formField('License renewal date', input('license_renewal_date', { type: 'date', value: p?.license_renewal_date || '' })));
     form.appendChild(formField('Airbnb iCal URL', input('airbnb_ical_url', { value: p?.airbnb_ical_url, placeholder: 'https://www.airbnb.com/calendar/ical/…' }), { full: true }));
     form.appendChild(formField('VRBO iCal URL', input('vrbo_ical_url', { value: p?.vrbo_ical_url, placeholder: 'http://www.vrbo.com/icalendar/…' }), { full: true }));
+    if (p && p.id && p.ical_token) {
+      const feedUrl = location.origin + '/api/public/ical/' + p.id + '.ics?token=' + p.ical_token;
+      const feedInput = el('input', { type: 'text', value: feedUrl, readonly: 'true', style: 'flex:1;min-width:0;' });
+      feedInput.addEventListener('click', () => feedInput.select());
+      const copyBtn = el('button', { class: 'btn-ghost small', type: 'button', onclick: () => { navigator.clipboard && navigator.clipboard.writeText(feedUrl); toast('Feed URL copied', 'success'); } }, 'Copy');
+      form.appendChild(formField('⬆ Export feed (.ics) — paste into Airbnb / VRBO / Cottages Canada to block all your booked dates',
+        el('div', { style: 'display:flex;gap:8px;align-items:center;' }, feedInput, copyBtn), { full: true }));
+    }
     form.appendChild(formField('Welcome message (SMS greeting sent to guests)',
       textarea('welcome_message', p?.welcome_message, { rows: 3, placeholder: 'e.g. "Welcome back! The kayak is yours, the firewood is by the shed, and the WiFi password is on the fridge."' }),
       { full: true }
@@ -701,6 +709,18 @@
       API.calendar(), API.properties.list(), API.bookingTypes.list(), API.guests.list(), API.bookings.list(),
     ]);
     const reRender = () => setView('calendar');
+    // PriceLabs recommended-price overlay (default OFF; toggled on per device).
+    let showPrices = localStorage.getItem('cal_show_prices') === 'on';
+    let priceByProp = null;
+    async function ensurePrices() {
+      if (priceByProp) return;
+      priceByProp = {};
+      const data = await API.pricing().catch(() => null);
+      if (data && data.properties) data.properties.forEach(p => {
+        const m = {}; (p.prices || []).forEach(pr => { m[pr.date] = { rec: pr.recommended_price, demand: pr.demand }; });
+        priceByProp[p.property_id] = m;
+      });
+    }
     const wrap = el('div', { class: 'cal-wrap' });
     const head = el('div', { class: 'cal-head' });
     const monthLbl = el('h2', null, calCursor.toLocaleDateString('en-CA', { year: 'numeric', month: 'long' }));
@@ -717,9 +737,11 @@
     const agendaBtn = el('button', { class: 'btn-ghost small', onclick: () => { calMode = 'agenda'; localStorage.setItem('cal_mode', 'agenda'); render(); } }, '☰ Agenda');
     const gridBtn = el('button', { class: 'btn-ghost small', onclick: () => { calMode = 'grid'; localStorage.setItem('cal_mode', 'grid'); render(); } }, '▦ Month');
     const modeToggle = el('div', { class: 'cal-mode-toggle' }, agendaBtn, gridBtn);
+    const pricesBtn = el('button', { class: 'btn-ghost small', title: 'Overlay PriceLabs recommended nightly rates (pick one property)',
+      onclick: async () => { showPrices = !showPrices; localStorage.setItem('cal_show_prices', showPrices ? 'on' : 'off'); if (showPrices) await ensurePrices(); render(); } }, '💲 Prices');
     head.appendChild(el('div', { class: 'btn-row' }, prev, today, next));
     head.appendChild(monthLbl);
-    head.appendChild(el('div', { class: 'cal-head-controls', style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;' }, modeToggle, propFilter, blockBtn));
+    head.appendChild(el('div', { class: 'cal-head-controls', style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;' }, modeToggle, pricesBtn, propFilter, blockBtn));
     wrap.appendChild(head);
     const body = el('div', { class: 'cal-body' });
     wrap.appendChild(body);
@@ -741,6 +763,7 @@
       body.innerHTML = '';
       agendaBtn.classList.toggle('active', calMode === 'agenda');
       gridBtn.classList.toggle('active', calMode === 'grid');
+      pricesBtn.classList.toggle('active', showPrices);
       const propId = propFilter.value;
       const todayStr = isoToday();
       const filtered = events.filter(ev => !propId || String(ev.property_id) === propId);
@@ -854,6 +877,12 @@
         cell.appendChild(el('button', { class: 'cal-add-task', title: 'Add a booking, task, or block on this day',
           onclick: (e) => { e.stopPropagation(); dayAddMenu(iso); } }, '+'));
       }
+      // PriceLabs recommended nightly rate overlay (single property selected)
+      if (showPrices && priceByProp && propFilter.value) {
+        const pr = (priceByProp[Number(propFilter.value)] || {})[iso];
+        if (pr && pr.rec != null) cell.querySelector('.dnum').appendChild(
+          el('span', { class: 'cal-price', title: 'PriceLabs recommended' + (pr.demand ? ' • ' + pr.demand : '') }, fmtMoney(pr.rec)));
+      }
       const dayEvs = evs.filter(ev => inRange(ev.start, ev.end, iso));
 
       // Conflict = 2+ guest entries (booking or unclaimed reservation) at one property today.
@@ -931,7 +960,7 @@
 
       return cell;
     }
-    render();
+    if (showPrices) ensurePrices().then(render); else render();
     root.appendChild(el('div', { class: 'between' },
       el('h1', null, 'Calendar'),
       el('div', { class: 'cal-legend', style: 'display:flex;align-items:center;gap:12px;font-size:12px;flex-wrap:wrap;' },
@@ -2468,18 +2497,25 @@ Matt`;
     const form = el('form', { class: 'form-grid' });
     const inputs = types.map(t => {
       const fee = input('fee_' + t.id, { type: 'number', step: '0.1', value: t.fee_percent == null ? 0 : t.fee_percent });
+      fee.style.width = '70px';
+      const fixed = input('fixed_' + t.id, { type: 'number', step: '0.01', value: t.fee_fixed == null ? 0 : t.fee_fixed });
+      fixed.style.width = '80px';
       const direct = el('input', { type: 'checkbox', name: 'direct_' + t.id, style: 'width:auto;' }); direct.checked = !!t.is_direct;
-      form.appendChild(el('div', { style: 'grid-column:1/-1;display:flex;gap:10px;align-items:center;' },
-        el('strong', { style: 'width:130px;' }, t.name), el('span', { class: 'muted' }, 'fee %'), fee,
-        el('label', { style: 'display:flex;gap:4px;align-items:center;' }, direct, 'direct booking')));
-      return { t, fee, direct };
+      form.appendChild(el('div', { style: 'grid-column:1/-1;display:flex;gap:8px;align-items:center;flex-wrap:wrap;' },
+        el('strong', { style: 'width:120px;' }, t.name),
+        el('span', { class: 'muted' }, '%'), fee,
+        el('span', { class: 'muted' }, '+ $/booking'), fixed,
+        el('label', { style: 'display:flex;gap:4px;align-items:center;' }, direct, 'direct')));
+      return { t, fee, fixed, direct };
     });
+    form.appendChild(el('div', { class: 'muted', style: 'grid-column:1/-1;font-size:12px;' },
+      'Use % for commission channels (Airbnb, VRBO) and "$/booking" for flat per-booking fees. A flat annual listing fee (e.g. Cottages Canada) is best tracked as an Expense instead.'));
     form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' },
       el('button', { class: 'btn-primary', type: 'submit' }, 'Save fees'),
       el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      for (const { t, fee, direct } of inputs) await API.bookingTypeUpdate(t.id, { fee_percent: Number(fee.value) || 0, is_direct: direct.checked ? 1 : 0 });
+      for (const { t, fee, fixed, direct } of inputs) await API.bookingTypeUpdate(t.id, { fee_percent: Number(fee.value) || 0, fee_fixed: Number(fixed.value) || 0, is_direct: direct.checked ? 1 : 0 });
       toast('Channel fees saved', 'success'); closeModal(); setView('financials');
     });
     openModal('Channel fees', form);

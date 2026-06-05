@@ -7,6 +7,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const ical = require('node-ical');
 const multer = require('multer');
@@ -76,8 +77,8 @@ const TABLE_KEYS = ['properties','booking_types','guests','cleaners','bookings',
 const tbl = k => 'rental_' + k;
 // Whitelisted columns per table — strips any computed/extra props before writing to Postgres.
 const COLS = {
-  properties: ['id','created_at','nickname','address','airbnb_ical_url','vrbo_ical_url','notes','welcome_message','default_cleaner_id','public_bookable','license_status','license_renewal_date','check_in_instructions','nearby_attractions','contact_info','pricelabs_listing_id','pricelabs_pms'],
-  booking_types: ['id','created_at','name','fee_percent','is_direct'],
+  properties: ['id','created_at','nickname','address','airbnb_ical_url','vrbo_ical_url','notes','welcome_message','default_cleaner_id','public_bookable','license_status','license_renewal_date','check_in_instructions','nearby_attractions','contact_info','pricelabs_listing_id','pricelabs_pms','ical_token'],
+  booking_types: ['id','created_at','name','fee_percent','is_direct','fee_fixed'],
   guests: ['id','created_at','name','email','phone','address','notes'],
   cleaners: ['id','created_at','name','phone','email','rate','notes'],
   bookings: ['id','created_at','property_id','booking_type_id','guest_id','check_in','check_out','amount','contact_name','notes','invite_sent','source_uid','guest_notified_at','door_code','status'],
@@ -113,7 +114,7 @@ function ctx() { return als.getStore(); }
 
 const NUMERIC = {
   bookings: ['amount'], cleaners: ['rate'], expenses: ['amount'], upsells: ['default_price'],
-  booking_upsells: ['price', 'qty'], reviews: ['rating'], booking_types: ['fee_percent'],
+  booking_upsells: ['price', 'qty'], reviews: ['rating'], booking_types: ['fee_percent', 'fee_fixed'],
   price_cache: ['recommended_price', 'user_price'],
 };
 async function loadSnapshot() {
@@ -382,7 +383,8 @@ function joinBooking(b) {
   const ups = store.booking_upsells.filter(u => u.booking_id === b.id);
   const upsell_total = ups.reduce((a, u) => a + (Number(u.price) || 0) * (Number(u.qty) || 1), 0);
   const fee_percent = t ? (Number(t.fee_percent) || 0) : 0;
-  const platform_fee = +(((Number(b.amount) || 0) * fee_percent) / 100).toFixed(2);
+  const fee_fixed = t ? (Number(t.fee_fixed) || 0) : 0;
+  const platform_fee = +((((Number(b.amount) || 0) * fee_percent) / 100) + fee_fixed).toFixed(2);
   return { ...b,
     property_name: p?.nickname || null,
     booking_type_name: t?.name || null,
@@ -453,6 +455,7 @@ app.post('/api/properties', (req, res) => {
     public_bookable: public_bookable ? 1 : 0,
     license_status: license_status || 'unlicensed',
     license_renewal_date: license_renewal_date || null,
+    ical_token: crypto.randomBytes(16).toString('hex'),
   });
   for (const i of DEFAULT_MAINTENANCE_ITEMS) {
     tableInsert('maintenance_items', { property_id: row.id, item_name: i.item_name, category: i.category, in_stock: 1, notes: '' });
@@ -1164,6 +1167,42 @@ app.delete('/api/blocks/:id', (req, res) => {
   ok(res, { ok: true });
 });
 
+// ---------- iCAL EXPORT FEED (per property) ----------
+// A private, token-protected .ics feed of every occupied span for one property
+// (manual + platform + direct bookings + blocks). Import it into Airbnb / VRBO /
+// Cottages Canada so each platform blocks dates booked anywhere — closes the loop.
+function icsEscape(s) { return String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\r?\n/g, '\\n'); }
+function icsDate(iso) { return (iso || '').replace(/-/g, ''); }
+function slugForFile(s) { return String(s || 'property').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'property'; }
+function buildPropertyIcs(property) {
+  const events = buildCalendarEvents().filter(e => e.property_id === property.id && (e.kind === 'booking' || e.kind === 'reserved' || e.kind === 'block'));
+  const stamp = nowIso().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Rental Tracker//EN', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH',
+    'X-WR-CALNAME:' + icsEscape(property.nickname + ' availability')];
+  events.forEach((e, i) => {
+    if (!e.start) return;
+    const end = (e.end && e.end > e.start) ? e.end : addDays(e.start, 1); // DTEND is exclusive for all-day events
+    const summary = e.kind === 'block' ? (e.reason || 'Blocked') : 'Reserved';
+    lines.push('BEGIN:VEVENT',
+      'UID:' + (e.id || ('evt' + i)) + '-p' + property.id + '@rental-tracker',
+      'DTSTAMP:' + stamp,
+      'DTSTART;VALUE=DATE:' + icsDate(e.start),
+      'DTEND;VALUE=DATE:' + icsDate(end),
+      'SUMMARY:' + icsEscape(summary),
+      'END:VEVENT');
+  });
+  lines.push('END:VCALENDAR');
+  return lines.join('\r\n') + '\r\n';
+}
+app.get('/api/public/ical/:pid.ics', (req, res) => {
+  const property = tableFind('properties', req.params.pid);
+  if (!property) return res.status(404).type('text/plain').send('not found');
+  if (!property.ical_token || req.query.token !== property.ical_token) return res.status(403).type('text/plain').send('forbidden');
+  res.set('Content-Type', 'text/calendar; charset=utf-8');
+  res.set('Content-Disposition', 'inline; filename="' + slugForFile(property.nickname) + '.ics"');
+  res.send(buildPropertyIcs(property));
+});
+
 // ---------- DASHBOARD ----------
 function daysBetween(a, b) {
   const ms = new Date(b) - new Date(a);
@@ -1698,6 +1737,7 @@ app.put('/api/settings', (req, res) => {
 app.put('/api/booking-types/:id', (req, res) => {
   const b = req.body || {}; const patch = {};
   if (b.fee_percent != null) patch.fee_percent = Number(b.fee_percent) || 0;
+  if (b.fee_fixed != null) patch.fee_fixed = Number(b.fee_fixed) || 0;
   if (b.is_direct != null) patch.is_direct = b.is_direct ? 1 : 0;
   if (b.name != null) patch.name = b.name;
   const row = tableUpdate('booking_types', req.params.id, patch);
@@ -1729,7 +1769,7 @@ function computeFinancials(year) {
     const bs = bookings.filter(b => b.booking_type_id === t.id);
     const rev = bs.reduce((a, b) => a + (b.amount || 0) + (b.upsell_total || 0), 0);
     const fee = bs.reduce((a, b) => a + (b.platform_fee || 0), 0);
-    return { type: t.name, fee_percent: Number(t.fee_percent) || 0, is_direct: t.is_direct ? 1 : 0, bookings: bs.length, revenue: +rev.toFixed(2), fees: +fee.toFixed(2), net: +(rev - fee).toFixed(2), effective_rate: rev > 0 ? +((rev - fee) / rev).toFixed(3) : 0 };
+    return { type: t.name, fee_percent: Number(t.fee_percent) || 0, fee_fixed: Number(t.fee_fixed) || 0, is_direct: t.is_direct ? 1 : 0, bookings: bs.length, revenue: +rev.toFixed(2), fees: +fee.toFixed(2), net: +(rev - fee).toFixed(2), effective_rate: rev > 0 ? +((rev - fee) / rev).toFixed(3) : 0 };
   }).filter(c => c.bookings > 0).sort((a, b) => b.net - a.net);
   const byCategory = {};
   expenses.forEach(e => { const k = e.category || 'Other'; byCategory[k] = (byCategory[k] || 0) + (e.amount || 0); });

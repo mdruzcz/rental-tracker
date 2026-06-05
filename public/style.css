@@ -216,6 +216,8 @@ textarea { resize: vertical; min-height: 60px; }
 .cal-mode-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
 .cal-mode-toggle button { border: none; border-radius: 0; margin: 0; }
 .cal-mode-toggle button.active { background: var(--accent); color: #fff; }
+.btn-ghost.small.active { background: var(--accent); color: #fff; }
+.cal-price { float: right; font-size: 10px; font-weight: 700; color: var(--accent); background: var(--accent-soft); border-radius: 4px; padding: 0 4px; }
 
 /* Agenda (mobile-friendly list) */
 .cal-body { overflow-x: auto; }
