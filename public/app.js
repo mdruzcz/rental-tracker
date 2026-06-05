@@ -89,6 +89,17 @@
       return true;
     },
     logout() { this.session = null; this.persist(); },
+    async updatePassword(newPassword) {
+      const token = await this.token();
+      if (!token) throw new Error('not signed in');
+      const r = await fetch(`${this.url}/auth/v1/user`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json', apikey: this.anonKey, Authorization: 'Bearer ' + token },
+        body: JSON.stringify({ password: newPassword }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error_description || data.msg || data.error || 'Password change failed');
+      return data;
+    },
     async token() {
       if (this.isValid()) return this.session.access_token;
       if (this.session && this.session.refresh_token) { if (await this.refresh()) return this.session.access_token; }
@@ -158,6 +169,7 @@
     blocks: {
       list: () => api('GET', '/api/blocks'),
       create: (b) => api('POST', '/api/blocks', b),
+      update: (id, b) => api('PUT', `/api/blocks/${id}`, b),
       remove: (id) => api('DELETE', `/api/blocks/${id}`),
     },
     // --- Profit & automation (Phases C–H) ---
@@ -682,7 +694,6 @@
 
   // ---------- CALENDAR ----------
   let calCursor = new Date();
-  let calHideSynced = false;
   // 'agenda' (mobile-friendly list) or 'grid' (full month). Defaults by screen width, then remembered.
   let calMode = localStorage.getItem('cal_mode') || (window.innerWidth <= 760 ? 'agenda' : 'grid');
   VIEWS.calendar = async (root) => {
@@ -701,14 +712,6 @@
     const next = el('button', { class: 'btn-ghost', onclick: () => { calCursor.setMonth(calCursor.getMonth() + 1); setView('calendar'); } }, '→');
     const today = el('button', { class: 'btn-ghost', onclick: () => { calCursor = new Date(); setView('calendar'); } }, 'Today');
 
-    // Hide synced toggle
-    const hideSyncedLabel = el('label', { class: 'cal-hide-synced', style: 'display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap;' });
-    const hideSyncedCb = el('input', { type: 'checkbox', style: 'width:auto;margin:0;' });
-    hideSyncedCb.checked = calHideSynced;
-    hideSyncedCb.addEventListener('change', () => { calHideSynced = hideSyncedCb.checked; render(); });
-    hideSyncedLabel.appendChild(hideSyncedCb);
-    hideSyncedLabel.appendChild(document.createTextNode('Hide synced (Airbnb/VRBO)'));
-
     const blockBtn = el('button', { class: 'btn-ghost', onclick: () => blockForm(null, props, reRender) }, '▦ Block dates');
     // Mobile-friendly view toggle: Agenda (list) vs Month (grid)
     const agendaBtn = el('button', { class: 'btn-ghost small', onclick: () => { calMode = 'agenda'; localStorage.setItem('cal_mode', 'agenda'); render(); } }, '☰ Agenda');
@@ -716,7 +719,7 @@
     const modeToggle = el('div', { class: 'cal-mode-toggle' }, agendaBtn, gridBtn);
     head.appendChild(el('div', { class: 'btn-row' }, prev, today, next));
     head.appendChild(monthLbl);
-    head.appendChild(el('div', { class: 'cal-head-controls', style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;' }, modeToggle, propFilter, hideSyncedLabel, blockBtn));
+    head.appendChild(el('div', { class: 'cal-head-controls', style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;' }, modeToggle, propFilter, blockBtn));
     wrap.appendChild(head);
     const body = el('div', { class: 'cal-body' });
     wrap.appendChild(body);
@@ -740,8 +743,7 @@
       gridBtn.classList.toggle('active', calMode === 'grid');
       const propId = propFilter.value;
       const todayStr = isoToday();
-      let filtered = events.filter(ev => !propId || String(ev.property_id) === propId);
-      if (calHideSynced) filtered = filtered.filter(ev => ev.kind !== 'synced');
+      const filtered = events.filter(ev => !propId || String(ev.property_id) === propId);
 
       if (calMode === 'agenda') { renderAgenda(body, filtered, todayStr); return; }
 
@@ -768,9 +770,25 @@
     // Shared event-open behaviour (used by both grid cells and agenda rows).
     function openEvent(ev) {
       if (ev.kind === 'task') { API.todos.update(ev.todo_id, { status: ev.status === 'done' ? 'open' : 'done' }).then(reRender); return; }
-      if (ev.kind === 'block') { if (ev.manual && confirm('Remove this block (' + (ev.reason || 'Blocked') + ')?')) API.blocks.remove(ev.block_id).then(reRender); return; }
+      if (ev.kind === 'block') {
+        if (ev.manual) blockForm({ id: ev.block_id, property_id: ev.property_id, start_date: ev.start, end_date: ev.end, reason: ev.reason }, props, reRender);
+        else toast('Synced from ' + (ev.source || 'platform') + ' — edit it on that platform', 'error');
+        return;
+      }
       if (ev.kind === 'reserved') { claimSyncedForm(ev, props, types, guests, reRender); return; }
       const full = bookings.find(b => b.id === ev.booking_id); if (full) bookingForm(full, props, types, guests, { onSaved: reRender });
+    }
+    // Small chooser shown from a day cell: add a booking, task, or block on that date.
+    function dayAddMenu(dateIso) {
+      const wrap = el('div', { class: 'form-grid' });
+      wrap.appendChild(el('div', { class: 'muted', style: 'grid-column:1/-1;' }, 'Add to ' + fmtDate(dateIso)));
+      const mk = (label, fn) => el('button', { class: 'btn-ghost', style: 'justify-content:flex-start;', onclick: () => { closeModal(); fn(); } }, label);
+      wrap.appendChild(el('div', { style: 'grid-column:1/-1;display:flex;flex-direction:column;gap:8px;' },
+        mk('📅  New booking', () => bookingForm(null, props, types, guests, { onSaved: reRender, defaultDate: dateIso })),
+        mk('📋  New task', () => quickTaskForm(dateIso, props, reRender)),
+        mk('▦  Block these dates', () => blockForm({ start_date: dateIso }, props, reRender)),
+      ));
+      openModal('Add to calendar', wrap);
     }
     // Mobile-friendly chronological list for the visible month.
     function renderAgenda(container, filtered, todayStr) {
@@ -831,10 +849,10 @@
       const iso = localIso(date);
       const cell = el('div', { class: 'cal-day' + (isOther ? ' other' : '') + (iso === todayStr ? ' today' : '') },
         el('div', { class: 'dnum' }, String(date.getDate())));
-      // Quick-add a task on this day
+      // Add a booking / task / block on this day
       if (!isOther) {
-        cell.appendChild(el('button', { class: 'cal-add-task', title: 'Add a task on this day',
-          onclick: (e) => { e.stopPropagation(); quickTaskForm(iso, props, reRender); } }, '+'));
+        cell.appendChild(el('button', { class: 'cal-add-task', title: 'Add a booking, task, or block on this day',
+          onclick: (e) => { e.stopPropagation(); dayAddMenu(iso); } }, '+'));
       }
       const dayEvs = evs.filter(ev => inRange(ev.start, ev.end, iso));
 
@@ -873,15 +891,12 @@
 
         if (ev.kind === 'block') {
           const manual = ev.manual;
+          const label = (ev.property_name ? ev.property_name + ' — ' : '') + (manual ? (ev.reason || 'Blocked') : 'Blocked');
           cell.appendChild(el('div', {
             class: 'cal-event cal-block' + (manual ? ' manual' : ''),
-            title: (ev.property_name || '') + ' — ' + (manual ? (ev.reason || 'Blocked') + ' (manual — click to remove)' : 'Blocked / not available (' + ev.source + ')'),
-            onclick: manual ? async (e) => {
-              e.stopPropagation();
-              if (!confirm('Remove this block (' + (ev.reason || 'Blocked') + ')?')) return;
-              await API.blocks.remove(ev.block_id); reRender();
-            } : null,
-          }, '▦ ' + (manual ? (ev.reason || 'Blocked') : 'Blocked')));
+            title: (ev.property_name || '') + ' — ' + (manual ? (ev.reason || 'Blocked') + ' (' + fmtDate(ev.start) + ' → ' + fmtDate(ev.end) + ', click to edit)' : 'Blocked / not available (' + ev.source + ')'),
+            onclick: (e) => { e.stopPropagation(); openEvent(ev); },
+          }, '▦ ' + label));
           return;
         }
 
@@ -965,6 +980,7 @@
 
   // Manually block dates (owner stay, maintenance, etc.) — shows grey on the calendar.
   function blockForm(preset, props, onSaved) {
+    const editing = !!(preset && preset.id);
     const form = el('form', { class: 'form-grid' });
     const propOpts = props.map(p => ({ value: String(p.id), label: p.nickname }));
     form.appendChild(formField('Property *', select('property_id', propOpts, preset?.property_id)));
@@ -973,19 +989,27 @@
     form.appendChild(formField('To (checkout)', input('end_date', { type: 'date', value: preset?.end_date || '' })));
     form.appendChild(el('div', { class: 'muted', style: 'grid-column:1/-1;font-size:12px;' },
       'Blocked dates show in grey so these nights never get double-booked. "To" is the checkout morning (that night is free).'));
-    form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' },
-      el('button', { class: 'btn-primary', type: 'submit' }, 'Block dates'),
-      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
+    const btnRow = el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, editing ? 'Save block' : 'Block dates'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel'));
+    if (editing) {
+      btnRow.appendChild(el('button', { class: 'btn-danger', type: 'button', style: 'margin-left:auto;', onclick: async () => {
+        if (!confirm('Remove this block?')) return;
+        await API.blocks.remove(preset.id); closeModal(); onSaved && onSaved();
+      } }, 'Delete block'));
+    }
+    form.appendChild(btnRow);
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const d = readForm(form);
       if (!d.property_id || !d.start_date) { toast('Property and start date required', 'error'); return; }
+      const payload = { property_id: Number(d.property_id), start_date: d.start_date, end_date: d.end_date || null, reason: d.reason };
       try {
-        await API.blocks.create({ property_id: Number(d.property_id), start_date: d.start_date, end_date: d.end_date || null, reason: d.reason });
-        toast('Dates blocked', 'success'); closeModal(); onSaved && onSaved();
+        if (editing) await API.blocks.update(preset.id, payload); else await API.blocks.create(payload);
+        toast(editing ? 'Block updated' : 'Dates blocked', 'success'); closeModal(); onSaved && onSaved();
       } catch (e) {}
     });
-    openModal('Block dates', form);
+    openModal(editing ? 'Edit blocked dates' : 'Block dates', form);
   }
 
   // Quick-add a calendar task (e.g. "Assemble beds", "Refill inventory") from a day cell.
@@ -1270,7 +1294,7 @@
 
     form.appendChild(formField('Property *', select('property_id', propOpts, b?.property_id)));
     form.appendChild(formField('Booking type', select('booking_type_id', typeOpts, b?.booking_type_id || '')));
-    form.appendChild(formField('Check-in *', input('check_in', { type: 'date', value: b?.check_in || isoToday(), required: true })));
+    form.appendChild(formField('Check-in *', input('check_in', { type: 'date', value: b?.check_in || (opts && opts.defaultDate) || isoToday(), required: true })));
     form.appendChild(formField('Check-out', input('check_out', { type: 'date', value: b?.check_out })));
     form.appendChild(formField('Amount', input('amount', { type: 'number', value: b?.amount || '', step: '0.01' })));
     form.appendChild(formField('Existing guest', select('guest_id', guestOpts, b?.guest_id || '')));
@@ -2701,6 +2725,26 @@ Matt`;
       toast('Settings saved', 'success'); setView('settings');
     });
     root.appendChild(form);
+
+    // Change password (current logged-in user)
+    const pwCard = el('form', { class: 'card form-grid' });
+    pwCard.appendChild(el('h2', { style: 'grid-column:1/-1;' }, 'Change your password'));
+    pwCard.appendChild(el('div', { class: 'muted', style: 'grid-column:1/-1;font-size:13px;' }, 'Signed in as ' + ((Auth.session && Auth.session.email) || '')));
+    const np = input('new_password', { type: 'password', placeholder: 'New password (min 6 chars)' });
+    const cp = input('confirm_password', { type: 'password', placeholder: 'Confirm new password' });
+    pwCard.appendChild(formField('New password', np));
+    pwCard.appendChild(formField('Confirm password', cp));
+    const pwErr = el('div', { class: 'login-err', style: 'grid-column:1/-1;' });
+    pwCard.appendChild(pwErr);
+    pwCard.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;' }, el('button', { class: 'btn-primary', type: 'submit' }, 'Update password')));
+    pwCard.addEventListener('submit', async (ev) => {
+      ev.preventDefault(); pwErr.textContent = '';
+      if ((np.value || '').length < 6) { pwErr.textContent = 'Password must be at least 6 characters.'; return; }
+      if (np.value !== cp.value) { pwErr.textContent = 'Passwords do not match.'; return; }
+      try { await Auth.updatePassword(np.value); toast('Password updated', 'success'); np.value = ''; cp.value = ''; }
+      catch (e) { pwErr.textContent = e.message || 'Failed'; }
+    });
+    root.appendChild(pwCard);
   };
 
   // ---------- LOGIN GATE + BOOT ----------

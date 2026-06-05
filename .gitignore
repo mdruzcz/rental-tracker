@@ -7,3 +7,5 @@ backups/
 !.env.example
 *.log
 .vercel
+
+.vercel

@@ -1149,6 +1149,16 @@ app.post('/api/blocks', (req, res) => {
     reason: (reason || 'Blocked').trim() || 'Blocked',
   }));
 });
+app.put('/api/blocks/:id', (req, res) => {
+  const b = req.body || {};
+  const patch = {};
+  if (b.property_id != null) patch.property_id = Number(b.property_id);
+  if (b.start_date != null) patch.start_date = b.start_date;
+  if (b.end_date !== undefined) patch.end_date = b.end_date || (b.start_date || undefined);
+  if (b.reason != null) patch.reason = (b.reason || 'Blocked').trim() || 'Blocked';
+  const row = tableUpdate('manual_blocks', req.params.id, patch);
+  if (!row) return err(res, 404, 'not found'); ok(res, row);
+});
 app.delete('/api/blocks/:id', (req, res) => {
   tableRemove('manual_blocks', req.params.id);
   ok(res, { ok: true });
