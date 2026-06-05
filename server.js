@@ -256,6 +256,8 @@ const DEFAULT_SETTINGS = {
   tax_setaside_percent: 25, // HST/MAT/income set-aside on net profit
   pricelabs_enabled: true,
   messaging_autosend_enabled: false, // OFF by default — never auto-blast real guests until enabled
+  season_start_md: '06-01', // short-term rental season (MM-DD) — occupancy is measured over this window
+  season_end_md: '10-01',
 };
 
 async function seedDefaults() {
@@ -1208,6 +1210,15 @@ function daysBetween(a, b) {
   const ms = new Date(b) - new Date(a);
   return Math.max(1, Math.round(ms / 86400000));
 }
+// Occupied nights of a stay that fall inside [winStart, winEnd) — ISO dates, checkout-exclusive.
+function nightsInWindow(checkIn, checkOut, winStart, winEnd) {
+  if (!checkIn) return 0;
+  const s = checkIn > winStart ? checkIn : winStart;
+  const e0 = checkOut || checkIn;
+  const e = e0 < winEnd ? e0 : winEnd;
+  if (e <= s) return 0;
+  return Math.round((new Date(e) - new Date(s)) / 86400000);
+}
 function bookingNightsInMonth(booking, year, monthIdx) {
   const start = booking.check_in ? new Date(booking.check_in) : null;
   const end = booking.check_out ? new Date(booking.check_out) : start;
@@ -1239,13 +1250,17 @@ app.get('/api/dashboard', (req, res) => {
   }).sort((a, b) => b.earnings - a.earnings);
 
   const elapsedDays = daysBetween(yearStart, todayIso);
+  // Occupancy is measured over the short-term-rental SEASON, not the whole year.
+  const seasonStart = `${year}-${getSetting('season_start_md', '06-01')}`;
+  const seasonEnd = `${year}-${getSetting('season_end_md', '10-01')}`;
+  const seasonNights = Math.max(1, Math.round((new Date(seasonEnd) - new Date(seasonStart)) / 86400000));
   const byProperty = tableAll('properties').map(p => {
     const list = ytdBookings.filter(b => b.property_id === p.id);
     const earnings = list.reduce((a, b) => a + (b.amount || 0), 0);
     let nights = 0;
-    list.forEach(b => { if (b.check_in) nights += daysBetween(b.check_in, b.check_out || b.check_in); });
-    const occupancy = elapsedDays > 0 ? +(nights / elapsedDays).toFixed(3) : 0;
-    const revpar = elapsedDays > 0 ? +(earnings / elapsedDays).toFixed(2) : 0;
+    list.forEach(b => { nights += nightsInWindow(b.check_in, b.check_out, seasonStart, seasonEnd); });
+    const occupancy = +(nights / seasonNights).toFixed(3);
+    const revpar = +(earnings / seasonNights).toFixed(2);
     const adr = nights > 0 ? +(earnings / nights).toFixed(2) : 0;
     return { id: p.id, nickname: p.nickname, bookings: list.length, earnings, nights, occupancy, revpar, adr };
   }).sort((a, b) => b.earnings - a.earnings);
@@ -1339,6 +1354,10 @@ app.get('/api/dashboard', (req, res) => {
     all_time_bookings: allBookings.length,
     by_type: byType,
     by_property: byProperty,
+    season_start: seasonStart,
+    season_end: seasonEnd,
+    season_nights: seasonNights,
+    season_occupancy: +((byProperty.reduce((a, p) => a + p.nights, 0)) / (seasonNights * Math.max(1, byProperty.length))).toFixed(3),
     upcoming,
     low_stock_count: lowStockCount,
     pending_requests: pendingRequests,

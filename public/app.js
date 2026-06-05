@@ -343,12 +343,13 @@
       el('div', { class: 'muted' }, `All-time earnings: ${fmtMoney(d.all_time_earnings)} • ${d.all_time_bookings} bookings`)
     ));
 
-    const conflictKpi = el('div', { onclick: () => setView('calendar'), style: 'cursor:pointer;' },
+    const goCal = (hl, date) => { calHighlight = hl; calJumpDate = date || null; setView('calendar'); };
+    const conflictKpi = el('div', { onclick: () => goCal('conflicts', d.conflicts && d.conflicts[0] && d.conflicts[0].overlap_start), style: 'cursor:pointer;' },
       kpi('Booking Conflicts', d.conflict_count || 0, d.conflict_count > 0 ? 'double-bookings — review now' : 'no overlaps', d.conflict_count > 0 ? 'danger' : 'success'));
     const fin = d.financials || {};
     const netKpi = el('div', { onclick: () => setView('financials'), style: 'cursor:pointer;' },
       kpi('Net Profit (YTD)', fmtMoney(fin.net_profit || 0), `${((fin.margin || 0) * 100).toFixed(0)}% margin · ${fmtMoney(fin.total_expenses || 0)} costs`, 'success'));
-    const orphanKpi = el('div', { onclick: () => setView('calendar'), style: 'cursor:pointer;' },
+    const orphanKpi = el('div', { onclick: () => goCal('orphans', d.orphans && d.orphans[0] && d.orphans[0].gap_start), style: 'cursor:pointer;' },
       kpi('Orphan Nights', d.orphan_nights || 0, d.orphan_count > 0 ? `${d.orphan_count} fillable gap(s)` : 'none', d.orphan_count > 0 ? 'warn' : null));
     root.appendChild(el('div', { class: 'kpi-grid' },
       conflictKpi,
@@ -359,8 +360,8 @@
       orphanKpi,
       kpi('YTD Nights Booked', d.ytd_nights, 'nights occupied YTD'),
       kpi('Avg / Booking (YTD)', fmtMoney(d.avg_per_booking_ytd), 'average revenue per booking'),
-      el('div', { onclick: () => setView('calendar'), style: 'cursor:pointer;' },
-        kpi('Reservations Needing Details', d.unconfirmed_reservations || 0, d.unconfirmed_reservations > 0 ? 'add amount/guest on the calendar' : 'all synced stays confirmed', d.unconfirmed_reservations > 0 ? 'warn' : null)),
+      el('div', { onclick: () => setView('needsDetails'), style: 'cursor:pointer;' },
+        kpi('Reservations Needing Details', d.unconfirmed_reservations || 0, d.unconfirmed_reservations > 0 ? 'click to add amount/guest' : 'all synced stays confirmed', d.unconfirmed_reservations > 0 ? 'warn' : null)),
       kpi('Upcoming Bookings', d.upcoming.length, d.upcoming[0] ? `Next: ${fmtDate(d.upcoming[0].check_in)}` : 'none'),
       kpi('Pending Requests', d.pending_requests || 0, 'from public booking page', d.pending_requests > 0 ? 'warn' : null),
       kpi('Open To-Dos', d.open_todo_count || 0, d.overdue_todo_count > 0 ? `${d.overdue_todo_count} overdue` : 'none overdue', d.overdue_todo_count > 0 ? 'warn' : null),
@@ -373,7 +374,7 @@
       const cCard = el('div', { class: 'card conflict-card' });
       cCard.appendChild(el('div', { class: 'between' },
         el('h2', null, '⚠️ Booking Conflicts (' + d.conflicts.length + ')'),
-        el('button', { class: 'btn-ghost small', onclick: () => setView('calendar') }, 'Open calendar →'),
+        el('button', { class: 'btn-ghost small', onclick: () => goCal('conflicts', d.conflicts[0] && d.conflicts[0].overlap_start) }, 'Open calendar →'),
       ));
       cCard.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-bottom:8px;' },
         'Two guest reservations overlap at the same property. Resolve before they collide.'));
@@ -392,7 +393,7 @@
     if (d.orphans && d.orphans.length) {
       const oCard = el('div', { class: 'card', style: 'border-color:#fde68a;background:#fffbeb;' });
       oCard.appendChild(el('div', { class: 'between' }, el('h2', null, '🔆 Fillable Gap Nights (' + d.orphans.length + ')'),
-        el('button', { class: 'btn-ghost small', onclick: () => setView('calendar') }, 'Open calendar →')));
+        el('button', { class: 'btn-ghost small', onclick: () => goCal('orphans', d.orphans[0] && d.orphans[0].gap_start) }, 'Open calendar →')));
       oCard.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-bottom:8px;' }, 'Short empty gaps between bookings — drop the rate or set a min-stay to fill them before they\'re lost.'));
       d.orphans.forEach(o => oCard.appendChild(el('div', { style: 'padding:6px 0;border-top:1px solid #fde68a;font-size:13px;' },
         el('strong', null, o.property_name || 'Property'), ` — ${o.nights} night${o.nights > 1 ? 's' : ''}: ${fmtDate(o.gap_start)} → ${fmtDate(o.gap_end)}`)));
@@ -501,7 +502,7 @@
     const propCard = el('div', { class: 'card' });
     propCard.appendChild(el('h2', null, 'Earnings by Property (YTD)'));
     propCard.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-bottom:8px;' },
-      `RevPAR = revenue ÷ ${d.elapsed_days_ytd} elapsed days this year. ADR = revenue ÷ occupied nights. Occupancy = nights booked ÷ elapsed days.`
+      `Occupancy & RevPAR are measured over your rental season (${fmtDate(d.season_start)} → ${fmtDate(d.season_end)}, ${d.season_nights} nights). Occupancy = season nights booked ÷ ${d.season_nights}. ADR = revenue ÷ nights.`
     ));
     if (!d.by_property.length) {
       propCard.appendChild(el('div', { class: 'empty' }, 'Add a property to get started.'));
@@ -702,13 +703,23 @@
 
   // ---------- CALENDAR ----------
   let calCursor = new Date();
+  let calHighlight = null;  // 'conflicts' | 'orphans' — set by a dashboard deep-link
+  let calJumpDate = null;   // ISO date to jump the calendar to
   // 'agenda' (mobile-friendly list) or 'grid' (full month). Defaults by screen width, then remembered.
   let calMode = localStorage.getItem('cal_mode') || (window.innerWidth <= 760 ? 'agenda' : 'grid');
   VIEWS.calendar = async (root) => {
-    const [events, props, types, guests, bookings] = await Promise.all([
-      API.calendar(), API.properties.list(), API.bookingTypes.list(), API.guests.list(), API.bookings.list(),
+    const [events, props, types, guests, bookings, orphans] = await Promise.all([
+      API.calendar(), API.properties.list(), API.bookingTypes.list(), API.guests.list(), API.bookings.list(), API.orphans().catch(() => []),
     ]);
     const reRender = () => setView('calendar');
+    // Deep-link from the dashboard: jump to the month + turn on a highlight.
+    if (calJumpDate) { const jd = new Date(calJumpDate + 'T00:00:00'); if (!isNaN(jd)) calCursor = jd; calJumpDate = null; }
+    let highlightConflicts = calHighlight === 'conflicts';
+    let highlightOrphans = calHighlight === 'orphans';
+    calHighlight = null;
+    // Orphan nights as a {property_id: Set(dateIso)} map + an any-property set.
+    const orphanByProp = {}; const orphanAny = new Set();
+    orphans.forEach(o => { let d = o.gap_start; while (d < o.gap_end) { (orphanByProp[o.property_id] = orphanByProp[o.property_id] || new Set()).add(d); orphanAny.add(d); const dt = new Date(d + 'T00:00:00'); dt.setDate(dt.getDate() + 1); d = dt.toISOString().slice(0, 10); } });
     // PriceLabs recommended-price overlay (default OFF; toggled on per device).
     let showPrices = localStorage.getItem('cal_show_prices') === 'on';
     let priceByProp = null;
@@ -739,9 +750,13 @@
     const modeToggle = el('div', { class: 'cal-mode-toggle' }, agendaBtn, gridBtn);
     const pricesBtn = el('button', { class: 'btn-ghost small', title: 'Overlay PriceLabs recommended nightly rates (pick one property)',
       onclick: async () => { showPrices = !showPrices; localStorage.setItem('cal_show_prices', showPrices ? 'on' : 'off'); if (showPrices) await ensurePrices(); render(); } }, '💲 Prices');
+    const conflictsBtn = el('button', { class: 'btn-ghost small', title: 'Highlight double-bookings',
+      onclick: () => { highlightConflicts = !highlightConflicts; render(); } }, '⚠ Conflicts');
+    const orphansBtn = el('button', { class: 'btn-ghost small', title: 'Highlight fillable gap nights',
+      onclick: () => { highlightOrphans = !highlightOrphans; render(); } }, '🔆 Orphans');
     head.appendChild(el('div', { class: 'btn-row' }, prev, today, next));
     head.appendChild(monthLbl);
-    head.appendChild(el('div', { class: 'cal-head-controls', style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;' }, modeToggle, pricesBtn, propFilter, blockBtn));
+    head.appendChild(el('div', { class: 'cal-head-controls', style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;' }, modeToggle, pricesBtn, conflictsBtn, orphansBtn, propFilter, blockBtn));
     wrap.appendChild(head);
     const body = el('div', { class: 'cal-body' });
     wrap.appendChild(body);
@@ -764,6 +779,8 @@
       agendaBtn.classList.toggle('active', calMode === 'agenda');
       gridBtn.classList.toggle('active', calMode === 'grid');
       pricesBtn.classList.toggle('active', showPrices);
+      conflictsBtn.classList.toggle('active', highlightConflicts);
+      orphansBtn.classList.toggle('active', highlightOrphans);
       const propId = propFilter.value;
       const todayStr = isoToday();
       const filtered = events.filter(ev => !propId || String(ev.property_id) === propId);
@@ -872,6 +889,11 @@
       const iso = localIso(date);
       const cell = el('div', { class: 'cal-day' + (isOther ? ' other' : '') + (iso === todayStr ? ' today' : '') },
         el('div', { class: 'dnum' }, String(date.getDate())));
+      // Orphan-night highlight (toggle)
+      if (highlightOrphans) {
+        const isOrphan = propFilter.value ? (orphanByProp[Number(propFilter.value)] || new Set()).has(iso) : orphanAny.has(iso);
+        if (isOrphan) cell.classList.add('cal-hl-orphan');
+      }
       // Add a booking / task / block on this day
       if (!isOther) {
         cell.appendChild(el('button', { class: 'cal-add-task', title: 'Add a booking, task, or block on this day',
@@ -897,6 +919,7 @@
       }
       if (conflictProps.size > 0) {
         cell.classList.add('cal-conflict');
+        if (highlightConflicts) cell.classList.add('cal-hl-conflict');
         cell.querySelector('.dnum').appendChild(
           el('span', { class: 'cal-conflict-badge', title: 'Double-booking — two guest reservations at the same property on this date' }, '!'));
       }
@@ -2751,13 +2774,15 @@ Matt`;
     root.appendChild(el('h1', null, 'Settings'));
     const form = el('form', { class: 'card form-grid' });
     form.appendChild(formField('Tax set-aside %', input('tax_setaside_percent', { type: 'number', step: '0.5', value: s.tax_setaside_percent == null ? 25 : s.tax_setaside_percent })));
+    form.appendChild(formField('STR season start (MM-DD)', input('season_start_md', { value: s.season_start_md || '06-01', placeholder: '06-01' })));
+    form.appendChild(formField('STR season end (MM-DD)', input('season_end_md', { value: s.season_end_md || '10-01', placeholder: '10-01' })));
     const autocb = el('input', { type: 'checkbox', name: 'messaging_autosend_enabled', style: 'width:auto;' }); autocb.checked = !!s.messaging_autosend_enabled;
     form.appendChild(el('label', { style: 'grid-column:1/-1;display:flex;gap:8px;align-items:center;' }, autocb, 'Auto-send guest messages (SMS) when due'));
     form.appendChild(el('div', { class: 'muted', style: 'grid-column:1/-1;font-size:12px;' }, 'Tax set-aside is applied to net profit on the Money tab (HST/MAT/income). Channel fees are edited on the Money tab.'));
     form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' }, el('button', { class: 'btn-primary', type: 'submit' }, 'Save settings')));
     form.addEventListener('submit', async (ev) => {
       ev.preventDefault(); const d = readForm(form);
-      await API.settings.update({ tax_setaside_percent: Number(d.tax_setaside_percent) || 0, messaging_autosend_enabled: autocb.checked });
+      await API.settings.update({ tax_setaside_percent: Number(d.tax_setaside_percent) || 0, messaging_autosend_enabled: autocb.checked, season_start_md: d.season_start_md || '06-01', season_end_md: d.season_end_md || '10-01' });
       toast('Settings saved', 'success'); setView('settings');
     });
     root.appendChild(form);
@@ -2781,6 +2806,44 @@ Matt`;
       catch (e) { pwErr.textContent = e.message || 'Failed'; }
     });
     root.appendChild(pwCard);
+  };
+
+  // ---------- RESERVATIONS NEEDING DETAILS (editable list) ----------
+  VIEWS.needsDetails = async (root) => {
+    const [events, props, types, guests] = await Promise.all([API.calendar(), API.properties.list(), API.bookingTypes.list(), API.guests.list()]);
+    const reserved = events.filter(e => e.kind === 'reserved').sort((a, b) => (a.start || '').localeCompare(b.start || ''));
+    root.appendChild(el('div', { class: 'between' }, el('h1', null, 'Reservations Needing Details'),
+      el('button', { class: 'btn-ghost', onclick: () => setView('calendar') }, 'Open calendar →')));
+    root.appendChild(el('div', { class: 'muted', style: 'margin-bottom:12px;' },
+      'Synced Airbnb/VRBO reservations with no amount or guest yet. Fill each in and save — it becomes a tracked booking and drops off this list.'));
+    if (!reserved.length) { root.appendChild(el('div', { class: 'card empty' }, '🎉 All caught up — every synced reservation has its details.')); return; }
+    const guestOpts = [{ value: '', label: '— new guest below —' }].concat(guests.map(g => ({ value: String(g.id), label: g.name + (g.email ? ` <${g.email}>` : '') })));
+    reserved.forEach(ev => {
+      const card = el('form', { class: 'card form-grid' });
+      card.appendChild(el('div', { class: 'between', style: 'grid-column:1/-1;' },
+        el('strong', null, (ev.property_name || 'Property') + ' · ' + (ev.guest_name || 'Reserved')),
+        el('span', { class: 'muted', style: 'font-size:13px;' }, (ev.source || '').toUpperCase() + ' · ' + fmtDate(ev.start) + ' → ' + fmtDate(ev.end))));
+      const amount = input('amount', { type: 'number', step: '0.01', placeholder: 'e.g. 975.00' });
+      const guestSel = select('guest_id', guestOpts, '');
+      const newName = input('new_guest_name', { value: ev.guest_name || '', placeholder: 'guest name' });
+      card.appendChild(formField('Amount', amount));
+      card.appendChild(formField('Existing guest', guestSel));
+      card.appendChild(formField('+ New guest', newName));
+      card.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;' }, el('button', { class: 'btn-primary', type: 'submit' }, 'Save & confirm')));
+      card.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const payload = { amount: Number(amount.value) || 0 };
+        if (guestSel.value) payload.guest_id = Number(guestSel.value);
+        else if (newName.value) { payload.new_guest = { name: newName.value }; payload.guest_name = newName.value; }
+        else if (ev.guest_name) payload.guest_name = ev.guest_name;
+        try {
+          await API.claimSynced(ev.synced_event_id, payload);
+          toast('Saved', 'success'); card.remove();
+          if (!root.querySelectorAll('form.card').length) setView('needsDetails');
+        } catch (err) {}
+      });
+      root.appendChild(card);
+    });
   };
 
   // ---------- LOGIN GATE + BOOT ----------
