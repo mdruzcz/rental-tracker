@@ -3097,10 +3097,15 @@ Matt`;
   let annualYear = new Date().getFullYear();
   VIEWS.annual = async (root) => {
     const data = await API.annualPrediction.get(annualYear);
-    const MONTHS = [{ m: 6, label: 'Jun', auto: true }, { m: 7, label: 'Jul', auto: true }, { m: 8, label: 'Aug', auto: true }, { m: 9, label: 'Sep' }, { m: 10, label: 'Oct' }, { m: 11, label: 'Nov' }, { m: 12, label: 'Dec' }];
+    const ALL = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    const LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const SEASON = [6, 7, 8];
     const manual = {}; data.properties.forEach(p => { manual[p.id] = Object.assign({}, (data.manual || {})[p.id] || {}); });
     const actual = (pid, m) => Number((data.actuals[pid] || {})[m] || 0);
-    const val = (pid, M) => M.auto ? actual(pid, M.m) : (manual[pid][M.m] == null || manual[pid][M.m] === '' ? 0 : Number(manual[pid][M.m]) || 0);
+    const potential = (pid, m) => Number(((data.potential || {})[pid] || {})[m] || 0);
+    const prob = (pid, m) => { const v = manual[pid]['p' + m]; return v == null || v === '' ? 0 : Math.max(0, Math.min(100, Number(v) || 0)); };
+    const manualVal = (pid, m) => { const v = manual[pid][m]; return v == null || v === '' ? 0 : Number(v) || 0; };
+    const cellTotal = (pid, m) => SEASON.includes(m) ? (actual(pid, m) + prob(pid, m) / 100 * potential(pid, m)) : manualVal(pid, m);
 
     const yearOpts = []; const cy = new Date().getFullYear(); for (let y = cy + 1; y >= cy - 2; y--) yearOpts.push({ value: String(y), label: String(y) });
     const yearSel = select('ay', yearOpts, String(annualYear)); yearSel.style.width = 'auto';
@@ -3108,27 +3113,41 @@ Matt`;
     const saveBtn = el('button', { class: 'btn-primary', onclick: async () => { await API.annualPrediction.save({ year: annualYear, values: manual }); toast('Forecast saved', 'success'); } }, 'Save forecast');
     root.appendChild(el('div', { class: 'between' }, el('h1', null, 'Annual Forecast'),
       el('div', { style: 'display:flex;gap:8px;align-items:center;' }, el('span', { class: 'muted' }, 'Year'), yearSel, saveBtn)));
-    root.appendChild(el('div', { class: 'muted', style: 'margin-bottom:12px;' }, 'Jun–Aug pull live from your bookings (•). Sep–Dec are your manual forecast — type estimates and click Save (persists across sessions for both of you).'));
+    root.appendChild(el('div', { class: 'muted', style: 'margin-bottom:12px;' }, 'Jun–Aug show booked (•) + remaining fillable potential × your fill-probability %. Other months are manual forecasts. Click Save (persists for both of you).'));
 
     const card = el('div', { class: 'card', style: 'overflow-x:auto;' });
-    const tbl = el('table');
+    const tbl = el('table', { class: 'annual-table' });
     tbl.appendChild(el('thead', null, el('tr', null, el('th', null, 'Property'),
-      ...MONTHS.map(M => el('th', { class: 'num' }, M.label + (M.auto ? ' •' : ''))), el('th', { class: 'num' }, 'Total'))));
+      ...ALL.map(m => el('th', { class: 'num' }, LABELS[m - 1] + (SEASON.includes(m) ? ' •' : ''))), el('th', { class: 'num' }, 'Total'))));
     const tb = el('tbody');
-    const rowTot = {}, colTot = {}; let grandTd;
+    const rowTot = {}, colTot = {}, cellTotEl = {}; let grandTd;
     function recompute() {
       let grand = 0; const sums = {};
-      data.properties.forEach(p => { let rt = 0; MONTHS.forEach(M => { const v = val(p.id, M); rt += v; sums[M.m] = (sums[M.m] || 0) + v; }); rowTot[p.id].textContent = fmtMoney(rt); grand += rt; });
-      MONTHS.forEach(M => { colTot[M.m].textContent = fmtMoney(sums[M.m] || 0); });
+      data.properties.forEach(p => {
+        let rt = 0;
+        ALL.forEach(m => { const v = cellTotal(p.id, m); rt += v; sums[m] = (sums[m] || 0) + v; if (cellTotEl[p.id + '_' + m]) cellTotEl[p.id + '_' + m].textContent = '= ' + fmtMoney(v); });
+        rowTot[p.id].textContent = fmtMoney(rt); grand += rt;
+      });
+      ALL.forEach(m => { colTot[m].textContent = fmtMoney(sums[m] || 0); });
       grandTd.textContent = fmtMoney(grand);
     }
     data.properties.forEach(p => {
       const tr = el('tr', null, el('td', null, el('strong', null, p.nickname)));
-      MONTHS.forEach(M => {
-        if (M.auto) tr.appendChild(el('td', { class: 'num' }, fmtMoney(actual(p.id, M.m))));
-        else {
-          const inp = el('input', { type: 'number', step: '1', value: manual[p.id][M.m] != null ? manual[p.id][M.m] : '', placeholder: actual(p.id, M.m) ? String(actual(p.id, M.m)) : '0', style: 'width:84px;text-align:right;' });
-          inp.addEventListener('input', () => { manual[p.id][M.m] = inp.value; recompute(); });
+      ALL.forEach(m => {
+        if (SEASON.includes(m)) {
+          const pot = potential(p.id, m);
+          const probInp = el('input', { type: 'number', min: '0', max: '100', value: manual[p.id]['p' + m] != null ? manual[p.id]['p' + m] : '', placeholder: '%', style: 'width:46px;text-align:right;' });
+          probInp.addEventListener('input', () => { manual[p.id]['p' + m] = probInp.value; recompute(); });
+          const tot = el('div', { class: 'annual-cell-total' });
+          cellTotEl[p.id + '_' + m] = tot;
+          tr.appendChild(el('td', { class: 'num annual-season' },
+            el('div', { class: 'annual-actual' }, fmtMoney(actual(p.id, m))),
+            el('div', { class: 'muted', style: 'font-size:11px;' }, pot ? '+pot ' + fmtMoney(pot) : 'no open'),
+            el('div', { style: 'display:flex;align-items:center;gap:2px;justify-content:flex-end;' }, probInp, el('span', { class: 'muted', style: 'font-size:11px;' }, '%')),
+            tot));
+        } else {
+          const inp = el('input', { type: 'number', step: '1', value: manual[p.id][m] != null ? manual[p.id][m] : '', placeholder: '0', style: 'width:72px;text-align:right;' });
+          inp.addEventListener('input', () => { manual[p.id][m] = inp.value; recompute(); });
           tr.appendChild(el('td', { class: 'num' }, inp));
         }
       });
@@ -3136,7 +3155,7 @@ Matt`;
       tb.appendChild(tr);
     });
     const totRow = el('tr', { style: 'border-top:2px solid var(--border);font-weight:700;' }, el('td', null, 'All properties'));
-    MONTHS.forEach(M => { const td = el('td', { class: 'num' }); colTot[M.m] = td; totRow.appendChild(td); });
+    ALL.forEach(m => { const td = el('td', { class: 'num' }); colTot[m] = td; totRow.appendChild(td); });
     grandTd = el('td', { class: 'num', style: 'color:var(--success);' }); totRow.appendChild(grandTd);
     tb.appendChild(totRow);
     tbl.appendChild(tb); card.appendChild(tbl); root.appendChild(card);

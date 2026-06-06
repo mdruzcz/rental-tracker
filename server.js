@@ -2029,6 +2029,7 @@ function computePotentialRevenue(propIds, start, end, adrByProp, minStay) {
 // ---------- ANNUAL PREDICTION (per-property monthly revenue forecast) ----------
 app.get('/api/annual-prediction', (req, res) => {
   const year = Number(req.query.year) || new Date().getFullYear();
+  const todayIso = new Date().toISOString().slice(0, 10);
   const bookings = tableAll('bookings').map(joinBooking).filter(b => b.status !== 'cancelled');
   const actuals = {}; // property_id -> { month(1-12): revenue }
   tableAll('properties').forEach(p => { actuals[p.id] = {}; });
@@ -2038,10 +2039,30 @@ app.get('/api/annual-prediction', (req, res) => {
     if (!actuals[b.property_id]) return;
     actuals[b.property_id][m] = +(((actuals[b.property_id][m] || 0) + (b.amount || 0) + (b.upsell_total || 0))).toFixed(2);
   });
+  // Season ADR per property (fallback rate for the potential estimate)
+  const seasonStart = `${year}-${getSetting('season_start_md', '06-01')}`;
+  const seasonEnd = `${year}-${getSetting('season_end_md', '10-01')}`;
+  const adrByProp = {};
+  tableAll('properties').forEach(p => {
+    const list = bookings.filter(b => b.property_id === p.id && b.check_in >= seasonStart && b.check_in <= seasonEnd);
+    const earnings = list.reduce((a, b) => a + (b.amount || 0) + (b.upsell_total || 0), 0);
+    let nights = 0; list.forEach(b => { nights += nightsInWindow(b.check_in, b.check_out, seasonStart, seasonEnd); });
+    adrByProp[p.id] = nights > 0 ? +(earnings / nights).toFixed(2) : 0;
+  });
+  // Remaining fillable potential (3+ night runs) for Jun/Jul/Aug, per property.
+  const allPropIds = tableAll('properties').map(p => p.id);
+  const potential = {};
+  [6, 7, 8].forEach(mo => {
+    const mStart = `${year}-${String(mo).padStart(2, '0')}-01`;
+    const mEnd = `${year}-${String(mo + 1).padStart(2, '0')}-01`;
+    if (mEnd <= todayIso) return; // month already over
+    const start = todayIso > mStart ? todayIso : mStart;
+    computePotentialRevenue(allPropIds, start, mEnd, adrByProp, 3).by_property.forEach(p => { (potential[p.id] = potential[p.id] || {})[mo] = p.potential_revenue; });
+  });
   ok(res, {
     year,
     properties: tableAll('properties').sort((a, b) => (a.nickname || '').localeCompare(b.nickname || '')).map(p => ({ id: p.id, nickname: p.nickname })),
-    actuals,
+    actuals, potential,
     manual: getSetting('annual_prediction_' + year, {}),
   });
 });
