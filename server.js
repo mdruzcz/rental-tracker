@@ -260,6 +260,7 @@ const DEFAULT_SETTINGS = {
   messaging_autosend_enabled: false, // OFF by default — never auto-blast real guests until enabled
   season_start_md: '06-01', // short-term rental season (MM-DD) — occupancy is measured over this window
   season_end_md: '10-01',
+  projection_end_md: '09-07', // horizon for the "potential remaining revenue" projection
 };
 
 async function seedDefaults() {
@@ -1450,6 +1451,14 @@ app.get('/api/dashboard', (req, res) => {
   const metrics = computeMetrics(year);
   const orphans = computeOrphans(2);
 
+  // Potential remaining revenue if vacant nights (3+ night runs) were filled through the
+  // projection horizon. Excludes Look Out (under renovation).
+  const projStart = todayIso > seasonStart ? todayIso : seasonStart;
+  const projEnd = `${year}-${getSetting('projection_end_md', '09-07')}`;
+  const adrByProp = {}; byProperty.forEach(p => { adrByProp[p.id] = p.adr || 0; });
+  const projPropIds = tableAll('properties').filter(p => !/look\s*-?\s*out/i.test(p.nickname || '')).map(p => p.id);
+  const potential_revenue = projEnd > projStart ? computePotentialRevenue(projPropIds, projStart, projEnd, adrByProp, 3) : { total: 0, fillable_nights: 0, by_property: [], start: projStart, end: projEnd, min_stay: 3 };
+
   ok(res, {
     year,
     conflicts,
@@ -1460,6 +1469,7 @@ app.get('/api/dashboard', (req, res) => {
     orphans,
     orphan_count: orphans.length,
     orphan_nights: orphans.reduce((a, o) => a + o.nights, 0),
+    potential_revenue,
     ytd_earnings: ytdEarnings,
     ytd_bookings: ytdBookings.length,
     ytd_nights: totalNightsYtd,
@@ -1981,6 +1991,68 @@ function computeOrphans(maxGap) {
   return out.sort((a, b) => a.gap_start.localeCompare(b.gap_start));
 }
 app.get('/api/orphans', (req, res) => ok(res, computeOrphans(Number(req.query.max) || 2)));
+
+// Potential revenue if remaining vacant nights (in fillable runs >= minStay) were booked,
+// from `start` through `end`, for the given properties. Rate = PriceLabs recommended (cached)
+// per night, falling back to each property's ADR.
+function computePotentialRevenue(propIds, start, end, adrByProp, minStay) {
+  minStay = minStay || 3;
+  const events = buildCalendarEvents().filter(e => ['booking', 'reserved', 'block'].includes(e.kind));
+  const occByProp = {};
+  events.forEach(e => {
+    if (!e.start) return;
+    const eEnd = (e.end && e.end > e.start) ? e.end : addDays(e.start, 1);
+    let d = e.start > start ? e.start : start;
+    while (d < eEnd) { (occByProp[e.property_id] = occByProp[e.property_id] || new Set()).add(d); d = addDays(d, 1); }
+  });
+  const priceMap = {};
+  tableAll('price_cache').forEach(c => { (priceMap[c.property_id] = priceMap[c.property_id] || {})[c.date] = Number(c.recommended_price) || 0; });
+  const by_property = []; let total = 0, totalNights = 0;
+  for (const pid of propIds) {
+    const p = tableFind('properties', pid); if (!p) continue;
+    const occ = occByProp[pid] || new Set();
+    const vacant = []; let d = start;
+    while (d < end) { if (!occ.has(d)) vacant.push(d); d = addDays(d, 1); }
+    let revenue = 0, fillNights = 0, run = [];
+    const flush = () => {
+      if (run.length >= minStay) run.forEach(dt => { revenue += (priceMap[pid] && priceMap[pid][dt]) || adrByProp[pid] || 0; fillNights++; });
+      run = [];
+    };
+    for (let i = 0; i < vacant.length; i++) { if (run.length && vacant[i] !== addDays(run[run.length - 1], 1)) flush(); run.push(vacant[i]); }
+    flush();
+    by_property.push({ id: pid, nickname: p.nickname, fillable_nights: fillNights, potential_revenue: +revenue.toFixed(2), rate_source: (priceMap[pid] && Object.keys(priceMap[pid]).length) ? 'PriceLabs rates' : 'avg nightly rate' });
+    total += revenue; totalNights += fillNights;
+  }
+  return { total: +total.toFixed(2), fillable_nights: totalNights, min_stay: minStay, start, end, by_property: by_property.sort((a, b) => b.potential_revenue - a.potential_revenue) };
+}
+
+// ---------- ANNUAL PREDICTION (per-property monthly revenue forecast) ----------
+app.get('/api/annual-prediction', (req, res) => {
+  const year = Number(req.query.year) || new Date().getFullYear();
+  const bookings = tableAll('bookings').map(joinBooking).filter(b => b.status !== 'cancelled');
+  const actuals = {}; // property_id -> { month(1-12): revenue }
+  tableAll('properties').forEach(p => { actuals[p.id] = {}; });
+  bookings.forEach(b => {
+    if (!b.check_in || b.check_in.slice(0, 4) !== String(year)) return;
+    const m = Number(b.check_in.slice(5, 7));
+    if (!actuals[b.property_id]) return;
+    actuals[b.property_id][m] = +(((actuals[b.property_id][m] || 0) + (b.amount || 0) + (b.upsell_total || 0))).toFixed(2);
+  });
+  ok(res, {
+    year,
+    properties: tableAll('properties').sort((a, b) => (a.nickname || '').localeCompare(b.nickname || '')).map(p => ({ id: p.id, nickname: p.nickname })),
+    actuals,
+    manual: getSetting('annual_prediction_' + year, {}),
+  });
+});
+app.put('/api/annual-prediction', (req, res) => {
+  const year = Number((req.body || {}).year) || new Date().getFullYear();
+  const values = (req.body || {}).values || {};
+  const key = 'annual_prediction_' + year;
+  const existing = store.settings.find(s => s.key === key);
+  if (existing) tableUpdate('settings', existing.id, { value: values }); else tableInsert('settings', { key, value: values });
+  ok(res, { ok: true });
+});
 
 // ---------- GUEST MESSAGING ----------
 app.get('/api/message-templates', (req, res) => ok(res, tableAll('message_templates').sort((a, b) => (a.offset_days || 0) - (b.offset_days || 0))));

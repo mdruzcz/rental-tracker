@@ -209,6 +209,7 @@
     pricelabs: { listings: () => api('GET', '/api/pricelabs/listings'), refresh: () => api('POST', '/api/pricelabs/refresh') },
     pricing: () => api('GET', '/api/pricing'),
     quote: (propertyId, from, to) => api('GET', `/api/quote?property_id=${propertyId}&from=${from}&to=${to}`),
+    annualPrediction: { get: (year) => api('GET', '/api/annual-prediction' + (year ? '?year=' + year : '')), save: (b) => api('PUT', '/api/annual-prediction', b) },
     ltr: {
       overview: () => api('GET', '/api/ltr'),
       updateListing: (id, b) => api('PUT', `/api/properties/${id}/ltr`, b),
@@ -280,7 +281,7 @@
 
   // ---------- router ----------
   const VIEWS = {};
-  const TOOL_VIEWS = new Set(['ltr', 'pricing', 'requests', 'todos', 'guests', 'bulk', 'mailing', 'maintenance', 'cleanerCal', 'licensing', 'smsInbox', 'expenses', 'messaging', 'reviews', 'upsellCatalog', 'settings', 'cleaners']);
+  const TOOL_VIEWS = new Set(['ltr', 'annual', 'pricing', 'requests', 'todos', 'guests', 'bulk', 'mailing', 'maintenance', 'cleanerCal', 'licensing', 'smsInbox', 'expenses', 'messaging', 'reviews', 'upsellCatalog', 'settings', 'cleaners']);
   function setView(name) {
     $$('.tab').forEach(b => {
       if (b.classList.contains('tools-toggle')) {
@@ -353,6 +354,20 @@
   }
   // refreshBadges + interval are started by startApp() after a successful login.
 
+  function showPotentialBreakdown(pr) {
+    const wrap = el('div');
+    wrap.appendChild(el('div', { class: 'muted', style: 'margin-bottom:10px;' },
+      `Estimated revenue if every vacant night (in gaps of 3+ nights) were booked from ${fmtDate(pr.start)} through ${fmtDate(pr.end)}, at PriceLabs rates (or each property's average nightly rate).`));
+    if (!pr.by_property || !pr.by_property.length) { wrap.appendChild(el('div', { class: 'empty' }, 'Nothing to project.')); }
+    else {
+      wrap.appendChild(simpleTable(
+        ['Property', { label: 'Fillable nights', num: true }, { label: 'Potential', num: true }, 'Based on'],
+        pr.by_property.map(p => [p.nickname, p.fillable_nights, fmtMoney(p.potential_revenue), p.rate_source])));
+      wrap.appendChild(el('div', { style: 'text-align:right;font-size:18px;font-weight:700;margin-top:10px;color:var(--success);' }, 'Total: ' + fmtMoney(pr.total)));
+    }
+    openModal('Potential remaining revenue', wrap);
+  }
+
   // ---------- DASHBOARD ----------
   VIEWS.dashboard = async (root) => {
     const d = await API.dashboard();
@@ -369,9 +384,13 @@
       kpi('Net Profit (YTD)', fmtMoney(fin.net_profit || 0), `${((fin.margin || 0) * 100).toFixed(0)}% margin · ${fmtMoney(fin.total_expenses || 0)} costs`, 'success'));
     const orphanKpi = el('div', { onclick: () => goCal('orphans', d.orphans && d.orphans[0] && d.orphans[0].gap_start), style: 'cursor:pointer;' },
       kpi('Orphan Nights', d.orphan_nights || 0, d.orphan_count > 0 ? `${d.orphan_count} fillable gap(s)` : 'none', d.orphan_count > 0 ? 'warn' : null));
+    const pr = d.potential_revenue || { total: 0, by_property: [], fillable_nights: 0 };
+    const potentialKpi = el('div', { onclick: () => showPotentialBreakdown(pr), style: 'cursor:pointer;' },
+      kpi('Potential Remaining', fmtMoney(pr.total), `if ${pr.fillable_nights || 0} vacant nights filled (3+ night stays)`, pr.total > 0 ? 'success' : null));
     root.appendChild(el('div', { class: 'kpi-grid' },
       conflictKpi,
       netKpi,
+      potentialKpi,
       kpi('YTD Earnings', fmtMoney(d.ytd_earnings), `${d.ytd_bookings} bookings`, 'success'),
       el('div', { onclick: () => setView('financials'), style: 'cursor:pointer;' },
         kpi('Tax Set-Aside', fmtMoney(fin.tax_setaside || 0), `${fin.tax_setaside_percent || 0}% of net`, 'warn')),
@@ -726,10 +745,11 @@
   // 'agenda' (mobile-friendly list) or 'grid' (full month). Defaults by screen width, then remembered.
   let calMode = localStorage.getItem('cal_mode') || (window.innerWidth <= 760 ? 'agenda' : 'grid');
   VIEWS.calendar = async (root) => {
-    const [events, props, types, guests, bookings, orphans] = await Promise.all([
-      API.calendar(), API.properties.list(), API.bookingTypes.list(), API.guests.list(), API.bookings.list(), API.orphans().catch(() => []),
+    const [events, props, types, guests, bookings, orphans, todosList] = await Promise.all([
+      API.calendar(), API.properties.list(), API.bookingTypes.list(), API.guests.list(), API.bookings.list(), API.orphans().catch(() => []), API.todos.list().catch(() => []),
     ]);
     const reRender = () => setView('calendar');
+    let dragTaskId = null; // task being dragged to a new day
     // Deep-link from the dashboard: jump to the month + turn on a highlight.
     if (calJumpDate) { const jd = new Date(calJumpDate + 'T00:00:00'); if (!isNaN(jd)) calCursor = jd; calJumpDate = null; }
     let highlightConflicts = calHighlight === 'conflicts';
@@ -828,7 +848,11 @@
     }
     // Shared event-open behaviour (used by both grid cells and agenda rows).
     function openEvent(ev) {
-      if (ev.kind === 'task') { API.todos.update(ev.todo_id, { status: ev.status === 'done' ? 'open' : 'done' }).then(reRender); return; }
+      if (ev.kind === 'task') {
+        const full = todosList.find(t => t.id === ev.todo_id) || { id: ev.todo_id, title: ev.title, priority: ev.priority, due_date: ev.start, property_id: ev.property_id, status: ev.status };
+        todoForm(full, props, { onSaved: reRender });
+        return;
+      }
       if (ev.kind === 'block') {
         if (ev.manual) blockForm({ id: ev.block_id, property_id: ev.property_id, start_date: ev.start, end_date: ev.end, reason: ev.reason }, props, reRender);
         else toast('Synced from ' + (ev.source || 'platform') + ' — edit it on that platform', 'error');
@@ -907,8 +931,12 @@
     }
     function dayCell(date, isOther, evs, todayStr) {
       const iso = localIso(date);
-      const cell = el('div', { class: 'cal-day' + (isOther ? ' other' : '') + (iso === todayStr ? ' today' : '') },
-        el('div', { class: 'dnum' }, String(date.getDate())));
+      const cell = el('div', {
+        class: 'cal-day' + (isOther ? ' other' : '') + (iso === todayStr ? ' today' : ''),
+        ondragover: (e) => { if (dragTaskId != null) { e.preventDefault(); e.currentTarget.classList.add('cal-drop'); } },
+        ondragleave: (e) => e.currentTarget.classList.remove('cal-drop'),
+        ondrop: async (e) => { e.preventDefault(); e.currentTarget.classList.remove('cal-drop'); if (dragTaskId != null) { const id = dragTaskId; dragTaskId = null; await API.todos.update(id, { due_date: iso }); toast('Task moved', 'success'); reRender(); } },
+      }, el('div', { class: 'dnum' }, String(date.getDate())));
       // Orphan-night highlight (toggle)
       if (highlightOrphans) {
         const isOrphan = propFilter.value ? (orphanByProp[Number(propFilter.value)] || new Set()).has(iso) : orphanAny.has(iso);
@@ -955,8 +983,11 @@
           const done = ev.status === 'done';
           cell.appendChild(el('div', {
             class: 'cal-event cal-task' + (done ? ' done' : ''),
-            title: 'Task: ' + ev.title + (ev.property_name ? ' • ' + ev.property_name : '') + ' — click to toggle done',
-            onclick: async (e) => { e.stopPropagation(); await API.todos.update(ev.todo_id, { status: done ? 'open' : 'done' }); reRender(); },
+            draggable: 'true',
+            title: 'Task: ' + ev.title + (ev.property_name ? ' • ' + ev.property_name : '') + ' — click to edit, drag to move',
+            onclick: (e) => { e.stopPropagation(); openEvent(ev); },
+            ondragstart: (e) => { dragTaskId = ev.todo_id; e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', String(ev.todo_id)); } catch (x) {} },
+            ondragend: () => { dragTaskId = null; },
           }, el('span', { class: 'cal-task-icon' }, done ? '✓' : '📋'), el('span', { class: 'cal-ev-title' }, ev.title)));
           return;
         }
@@ -1271,7 +1302,8 @@
     render();
   };
 
-  function todoForm(t, props) {
+  function todoForm(t, props, opts) {
+    const onSaved = (opts && opts.onSaved) || (() => setView('todos'));
     const form = el('form', { class: 'form-grid' });
     const propOpts = [{ value: '', label: '— none —' }].concat(props.map(p => ({ value: String(p.id), label: p.nickname })));
     const priOpts = [{ value: 'high', label: 'High' }, { value: 'medium', label: 'Medium' }, { value: 'low', label: 'Low' }];
@@ -1292,7 +1324,7 @@
     );
     if (t) buttons.appendChild(el('button', { class: 'btn-danger', type: 'button', onclick: async () => {
       if (!confirm('Delete this task?')) return;
-      await API.todos.remove(t.id); closeModal(); setView('todos');
+      await API.todos.remove(t.id); closeModal(); onSaved();
     }}, 'Delete'));
     form.appendChild(buttons);
 
@@ -1309,7 +1341,7 @@
       if (t) payload.status = d.status || 'open';
       try {
         if (t) await API.todos.update(t.id, payload); else await API.todos.create(payload);
-        toast('Saved', 'success'); closeModal(); setView('todos');
+        toast('Saved', 'success'); closeModal(); onSaved();
       } catch (e) {}
     });
     openModal(t ? 'Edit task' : 'New task', form);
@@ -3057,6 +3089,56 @@ Matt`;
     });
     openModal(a ? 'Applicant — ' + (a.name || '') : 'Add applicant', form);
   }
+
+  // ---------- ANNUAL FORECAST ----------
+  let annualYear = new Date().getFullYear();
+  VIEWS.annual = async (root) => {
+    const data = await API.annualPrediction.get(annualYear);
+    const MONTHS = [{ m: 6, label: 'Jun', auto: true }, { m: 7, label: 'Jul', auto: true }, { m: 8, label: 'Aug', auto: true }, { m: 9, label: 'Sep' }, { m: 10, label: 'Oct' }, { m: 11, label: 'Nov' }, { m: 12, label: 'Dec' }];
+    const manual = {}; data.properties.forEach(p => { manual[p.id] = Object.assign({}, (data.manual || {})[p.id] || {}); });
+    const actual = (pid, m) => Number((data.actuals[pid] || {})[m] || 0);
+    const val = (pid, M) => M.auto ? actual(pid, M.m) : (manual[pid][M.m] == null || manual[pid][M.m] === '' ? 0 : Number(manual[pid][M.m]) || 0);
+
+    const yearOpts = []; const cy = new Date().getFullYear(); for (let y = cy + 1; y >= cy - 2; y--) yearOpts.push({ value: String(y), label: String(y) });
+    const yearSel = select('ay', yearOpts, String(annualYear)); yearSel.style.width = 'auto';
+    yearSel.addEventListener('change', () => { annualYear = Number(yearSel.value); setView('annual'); });
+    const saveBtn = el('button', { class: 'btn-primary', onclick: async () => { await API.annualPrediction.save({ year: annualYear, values: manual }); toast('Forecast saved', 'success'); } }, 'Save forecast');
+    root.appendChild(el('div', { class: 'between' }, el('h1', null, 'Annual Forecast'),
+      el('div', { style: 'display:flex;gap:8px;align-items:center;' }, el('span', { class: 'muted' }, 'Year'), yearSel, saveBtn)));
+    root.appendChild(el('div', { class: 'muted', style: 'margin-bottom:12px;' }, 'Jun–Aug pull live from your bookings (•). Sep–Dec are your manual forecast — type estimates and click Save (persists across sessions for both of you).'));
+
+    const card = el('div', { class: 'card', style: 'overflow-x:auto;' });
+    const tbl = el('table');
+    tbl.appendChild(el('thead', null, el('tr', null, el('th', null, 'Property'),
+      ...MONTHS.map(M => el('th', { class: 'num' }, M.label + (M.auto ? ' •' : ''))), el('th', { class: 'num' }, 'Total'))));
+    const tb = el('tbody');
+    const rowTot = {}, colTot = {}; let grandTd;
+    function recompute() {
+      let grand = 0; const sums = {};
+      data.properties.forEach(p => { let rt = 0; MONTHS.forEach(M => { const v = val(p.id, M); rt += v; sums[M.m] = (sums[M.m] || 0) + v; }); rowTot[p.id].textContent = fmtMoney(rt); grand += rt; });
+      MONTHS.forEach(M => { colTot[M.m].textContent = fmtMoney(sums[M.m] || 0); });
+      grandTd.textContent = fmtMoney(grand);
+    }
+    data.properties.forEach(p => {
+      const tr = el('tr', null, el('td', null, el('strong', null, p.nickname)));
+      MONTHS.forEach(M => {
+        if (M.auto) tr.appendChild(el('td', { class: 'num' }, fmtMoney(actual(p.id, M.m))));
+        else {
+          const inp = el('input', { type: 'number', step: '1', value: manual[p.id][M.m] != null ? manual[p.id][M.m] : '', placeholder: actual(p.id, M.m) ? String(actual(p.id, M.m)) : '0', style: 'width:84px;text-align:right;' });
+          inp.addEventListener('input', () => { manual[p.id][M.m] = inp.value; recompute(); });
+          tr.appendChild(el('td', { class: 'num' }, inp));
+        }
+      });
+      const rt = el('td', { class: 'num', style: 'font-weight:700;' }); rowTot[p.id] = rt; tr.appendChild(rt);
+      tb.appendChild(tr);
+    });
+    const totRow = el('tr', { style: 'border-top:2px solid var(--border);font-weight:700;' }, el('td', null, 'All properties'));
+    MONTHS.forEach(M => { const td = el('td', { class: 'num' }); colTot[M.m] = td; totRow.appendChild(td); });
+    grandTd = el('td', { class: 'num', style: 'color:var(--success);' }); totRow.appendChild(grandTd);
+    tb.appendChild(totRow);
+    tbl.appendChild(tb); card.appendChild(tbl); root.appendChild(card);
+    recompute();
+  };
 
   // ---------- LOGIN GATE + BOOT ----------
   function showLogin(message) {
