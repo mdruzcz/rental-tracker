@@ -752,8 +752,9 @@
     let dragTaskId = null; // task being dragged to a new day
     // Deep-link from the dashboard: jump to the month + turn on a highlight.
     if (calJumpDate) { const jd = new Date(calJumpDate + 'T00:00:00'); if (!isNaN(jd)) calCursor = jd; calJumpDate = null; }
-    let highlightConflicts = calHighlight === 'conflicts';
-    let highlightOrphans = calHighlight === 'orphans';
+    // Highlights persist across navigation; a dashboard deep-link can also force them on.
+    let highlightConflicts = calHighlight === 'conflicts' || localStorage.getItem('cal_hl_conflicts') === 'on';
+    let highlightOrphans = calHighlight === 'orphans' || localStorage.getItem('cal_hl_orphans') === 'on';
     calHighlight = null;
     // Orphan nights as a {property_id: Set(dateIso)} map + an any-property set.
     const orphanByProp = {}; const orphanAny = new Set();
@@ -773,13 +774,14 @@
     const wrap = el('div', { class: 'cal-wrap' });
     const head = el('div', { class: 'cal-head' });
     const monthLbl = el('h2', null, calCursor.toLocaleDateString('en-CA', { year: 'numeric', month: 'long' }));
-    const propFilter = select('propFilter', [{ value: '', label: 'All properties' }].concat(props.map(p => ({ value: String(p.id), label: p.nickname }))), '');
+    const propFilter = select('propFilter', [{ value: '', label: 'All properties' }].concat(props.map(p => ({ value: String(p.id), label: p.nickname }))), localStorage.getItem('cal_prop_filter') || '');
     propFilter.style.width = 'auto';
-    propFilter.addEventListener('change', () => render());
+    propFilter.addEventListener('change', () => { localStorage.setItem('cal_prop_filter', propFilter.value); render(); });
 
-    const prev = el('button', { class: 'btn-ghost', onclick: () => { calCursor.setMonth(calCursor.getMonth() - 1); setView('calendar'); } }, '←');
-    const next = el('button', { class: 'btn-ghost', onclick: () => { calCursor.setMonth(calCursor.getMonth() + 1); setView('calendar'); } }, '→');
-    const today = el('button', { class: 'btn-ghost', onclick: () => { calCursor = new Date(); setView('calendar'); } }, 'Today');
+    // Month navigation re-renders in place (keeps the property filter + toggles), no re-fetch.
+    const prev = el('button', { class: 'btn-ghost', onclick: () => { calCursor.setMonth(calCursor.getMonth() - 1); render(); } }, '←');
+    const next = el('button', { class: 'btn-ghost', onclick: () => { calCursor.setMonth(calCursor.getMonth() + 1); render(); } }, '→');
+    const today = el('button', { class: 'btn-ghost', onclick: () => { calCursor = new Date(); render(); } }, 'Today');
 
     const blockBtn = el('button', { class: 'btn-ghost', onclick: () => blockForm(null, props, reRender) }, '▦ Block dates');
     const quoteBtn = el('button', { class: 'btn-ghost', onclick: () => quoteEstimator(props, types, guests) }, '💲 Quote a stay');
@@ -790,9 +792,9 @@
     const pricesBtn = el('button', { class: 'btn-ghost small', title: 'Overlay PriceLabs recommended nightly rates (pick one property)',
       onclick: async () => { showPrices = !showPrices; localStorage.setItem('cal_show_prices', showPrices ? 'on' : 'off'); if (showPrices) await ensurePrices(); render(); } }, '💲 Prices');
     const conflictsBtn = el('button', { class: 'btn-ghost small', title: 'Highlight double-bookings',
-      onclick: () => { highlightConflicts = !highlightConflicts; render(); } }, '⚠ Conflicts');
+      onclick: () => { highlightConflicts = !highlightConflicts; localStorage.setItem('cal_hl_conflicts', highlightConflicts ? 'on' : 'off'); render(); } }, '⚠ Conflicts');
     const orphansBtn = el('button', { class: 'btn-ghost small', title: 'Highlight fillable gap nights',
-      onclick: () => { highlightOrphans = !highlightOrphans; render(); } }, '🔆 Orphans');
+      onclick: () => { highlightOrphans = !highlightOrphans; localStorage.setItem('cal_hl_orphans', highlightOrphans ? 'on' : 'off'); render(); } }, '🔆 Orphans');
     head.appendChild(el('div', { class: 'btn-row' }, prev, today, next));
     head.appendChild(monthLbl);
     head.appendChild(el('div', { class: 'cal-head-controls', style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;' }, modeToggle, pricesBtn, conflictsBtn, orphansBtn, propFilter, blockBtn, quoteBtn));
@@ -815,6 +817,7 @@
     }
     function render() {
       body.innerHTML = '';
+      monthLbl.textContent = calCursor.toLocaleDateString('en-CA', { year: 'numeric', month: 'long' });
       agendaBtn.classList.toggle('active', calMode === 'agenda');
       gridBtn.classList.toggle('active', calMode === 'grid');
       pricesBtn.classList.toggle('active', showPrices);
