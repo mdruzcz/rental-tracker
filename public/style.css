@@ -169,6 +169,7 @@ textarea { resize: vertical; min-height: 60px; }
 .cal-event.prop-escape { background: #dde7ea; color: #3d6b7a; }
 .cal-event.prop-retreat { background: #efe2d6; color: #a5674f; }
 .cal-event.prop-hideaway { background: #e1e9e0; color: #4f7355; }
+.cal-event.prop-lookout { background: #e8e1ee; color: #6b4f86; }
 .cal-event.prop-other { background: #f3f4f6; color: #374151; }
 .cal-event.synced { opacity: 0.7; font-style: italic; }
 .cal-event.conflict { outline: 2px solid #dc2626; }

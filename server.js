@@ -2113,6 +2113,31 @@ app.get('/api/pricing', async (req, res) => {
   ok(res, { listings_error: listErr, listings: listings.map(l => ({ id: l.id, pms: l.pms, name: l.name })), properties: props });
 });
 
+// Private booking estimator — sum PriceLabs recommended nightly rates for a stay.
+app.get('/api/quote', async (req, res) => {
+  const property = tableFind('properties', req.query.property_id);
+  if (!property) return err(res, 404, 'property not found');
+  const from = req.query.from, to = req.query.to;
+  if (!from || !to || to <= from) return err(res, 400, 'from and to (checkout, after from) are required');
+  if (!PRICELABS_KEY) return err(res, 503, 'PriceLabs API key not set');
+  if (!property.pricelabs_listing_id || !property.pricelabs_pms) return err(res, 400, 'Map this property to a PriceLabs listing in the Pricing tab first');
+  try {
+    const data = await pricelabsPrices(property.pricelabs_listing_id, property.pricelabs_pms, from, to);
+    const arr = Array.isArray(data) ? data : (data.listings || []);
+    const days = (arr[0] && arr[0].data) || [];
+    const currency = (arr[0] && arr[0].currency) || 'CAD';
+    const per_night = days.filter(d => d.date >= from && d.date < to).map(d => ({ date: d.date, price: Number(d.price) || 0, demand: d.demand_desc, min_stay: d.min_stay }));
+    const nightly_total = per_night.reduce((a, d) => a + d.price, 0);
+    let cleaning_fee = 0;
+    try { const ld = await pricelabsGet('/listings'); const l = (ld.listings || []).find(x => x.id === property.pricelabs_listing_id); if (l && l.cleaning_fees) cleaning_fee = Number(l.cleaning_fees) || 0; } catch (e) {}
+    ok(res, {
+      property_name: property.nickname, from, to, nights: per_night.length, currency, per_night,
+      nightly_total: +nightly_total.toFixed(2), avg_nightly: per_night.length ? +(nightly_total / per_night.length).toFixed(2) : 0,
+      cleaning_fee: +cleaning_fee.toFixed(2), total: +(nightly_total + cleaning_fee).toFixed(2),
+    });
+  } catch (e) { err(res, 502, 'PriceLabs: ' + e.message); }
+});
+
 // ---------- CRON (Vercel-scheduled message sender) ----------
 // On serverless there's no long-lived timer, so Vercel Cron pings this hourly.
 app.get('/api/cron/scheduler', async (req, res) => {

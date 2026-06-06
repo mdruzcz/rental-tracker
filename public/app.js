@@ -208,6 +208,7 @@
     sendMessage: (b) => api('POST', '/api/messages/send', b),
     pricelabs: { listings: () => api('GET', '/api/pricelabs/listings'), refresh: () => api('POST', '/api/pricelabs/refresh') },
     pricing: () => api('GET', '/api/pricing'),
+    quote: (propertyId, from, to) => api('GET', `/api/quote?property_id=${propertyId}&from=${from}&to=${to}`),
     ltr: {
       overview: () => api('GET', '/api/ltr'),
       updateListing: (id, b) => api('PUT', `/api/properties/${id}/ltr`, b),
@@ -279,7 +280,7 @@
 
   // ---------- router ----------
   const VIEWS = {};
-  const TOOL_VIEWS = new Set(['pricing', 'requests', 'todos', 'guests', 'bulk', 'mailing', 'maintenance', 'cleanerCal', 'licensing', 'smsInbox', 'expenses', 'messaging', 'reviews', 'upsellCatalog', 'settings', 'cleaners']);
+  const TOOL_VIEWS = new Set(['ltr', 'pricing', 'requests', 'todos', 'guests', 'bulk', 'mailing', 'maintenance', 'cleanerCal', 'licensing', 'smsInbox', 'expenses', 'messaging', 'reviews', 'upsellCatalog', 'settings', 'cleaners']);
   function setView(name) {
     $$('.tab').forEach(b => {
       if (b.classList.contains('tools-toggle')) {
@@ -761,6 +762,7 @@
     const today = el('button', { class: 'btn-ghost', onclick: () => { calCursor = new Date(); setView('calendar'); } }, 'Today');
 
     const blockBtn = el('button', { class: 'btn-ghost', onclick: () => blockForm(null, props, reRender) }, '▦ Block dates');
+    const quoteBtn = el('button', { class: 'btn-ghost', onclick: () => quoteEstimator(props, types, guests) }, '💲 Quote a stay');
     // Mobile-friendly view toggle: Agenda (list) vs Month (grid)
     const agendaBtn = el('button', { class: 'btn-ghost small', onclick: () => { calMode = 'agenda'; localStorage.setItem('cal_mode', 'agenda'); render(); } }, '☰ Agenda');
     const gridBtn = el('button', { class: 'btn-ghost small', onclick: () => { calMode = 'grid'; localStorage.setItem('cal_mode', 'grid'); render(); } }, '▦ Month');
@@ -773,7 +775,7 @@
       onclick: () => { highlightOrphans = !highlightOrphans; render(); } }, '🔆 Orphans');
     head.appendChild(el('div', { class: 'btn-row' }, prev, today, next));
     head.appendChild(monthLbl);
-    head.appendChild(el('div', { class: 'cal-head-controls', style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;' }, modeToggle, pricesBtn, conflictsBtn, orphansBtn, propFilter, blockBtn));
+    head.appendChild(el('div', { class: 'cal-head-controls', style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;' }, modeToggle, pricesBtn, conflictsBtn, orphansBtn, propFilter, blockBtn, quoteBtn));
     wrap.appendChild(head);
     const body = el('div', { class: 'cal-body' });
     wrap.appendChild(body);
@@ -900,6 +902,7 @@
       if (s.indexOf('escape') !== -1) return 'prop-escape';
       if (s.indexOf('retreat') !== -1) return 'prop-retreat';
       if (s.indexOf('hideaway') !== -1) return 'prop-hideaway';
+      if (s.indexOf('look') !== -1) return 'prop-lookout';
       return 'prop-other';
     }
     function dayCell(date, isOther, evs, todayStr) {
@@ -1007,6 +1010,7 @@
         el('span', { class: 'cal-event prop-escape', style: 'display:inline-block;padding:2px 8px;' }, 'Escape'),
         el('span', { class: 'cal-event prop-retreat', style: 'display:inline-block;padding:2px 8px;' }, 'Retreat'),
         el('span', { class: 'cal-event prop-hideaway', style: 'display:inline-block;padding:2px 8px;' }, 'Hideaway'),
+        el('span', { class: 'cal-event prop-lookout', style: 'display:inline-block;padding:2px 8px;' }, 'Look Out'),
         el('span', { style: 'color:#64748b;' }, '🔒 = verified on Airbnb/VRBO'),
         el('span', { style: 'color:#b45309;font-weight:600;' }, '＋ Add details = needs amount/guest'),
         el('span', { style: 'color:#64748b;' }, '▦ = blocked'),
@@ -1102,6 +1106,44 @@
       } catch (e) {}
     });
     openModal('Add calendar task', form);
+  }
+
+  // Private booking estimator — suggested price for a stay from PriceLabs nightly rates.
+  function quoteEstimator(props, types, guests) {
+    const wrap = el('div');
+    const form = el('form', { class: 'form-grid' });
+    form.appendChild(formField('Property', select('property_id', props.map(p => ({ value: String(p.id), label: p.nickname })), '')));
+    form.appendChild(formField('Check-in', input('from', { type: 'date', value: isoToday() })));
+    form.appendChild(formField('Check-out', input('to', { type: 'date' })));
+    form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, 'Calculate'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Close')));
+    const result = el('div', { style: 'margin-top:14px;' });
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const d = readForm(form);
+      if (!d.property_id || !d.from || !d.to) { toast('Pick a property and both dates', 'error'); return; }
+      result.innerHTML = ''; result.appendChild(el('div', { class: 'muted' }, 'Calculating…'));
+      try {
+        const q = await API.quote(d.property_id, d.from, d.to);
+        result.innerHTML = '';
+        result.appendChild(simpleTable(['Night', { label: 'Rate', num: true }, 'Demand'], q.per_night.map(n => [fmtDate(n.date), fmtMoney(n.price), n.demand || ''])));
+        result.appendChild(el('div', { style: 'margin-top:10px;display:flex;flex-direction:column;gap:3px;' },
+          el('div', { class: 'muted' }, q.nights + ' nights · avg ' + fmtMoney(q.avg_nightly) + '/night'),
+          el('div', null, 'Nightly total: ' + fmtMoney(q.nightly_total)),
+          q.cleaning_fee ? el('div', null, 'Cleaning fee: ' + fmtMoney(q.cleaning_fee)) : null,
+          el('div', { style: 'font-size:22px;font-weight:700;color:var(--success);margin-top:4px;' }, 'Suggested charge: ' + fmtMoney(q.total))));
+        result.appendChild(el('div', { class: 'btn-row', style: 'margin-top:10px;' },
+          el('button', { class: 'btn-ghost', type: 'button', onclick: () => { navigator.clipboard && navigator.clipboard.writeText(`${q.property_name} · ${fmtDate(q.from)} → ${fmtDate(q.to)} · ${q.nights} nights · ${fmtMoney(q.total)}`); toast('Quote copied', 'success'); } }, '📋 Copy quote'),
+          el('button', { class: 'btn-primary', type: 'button', onclick: () => {
+            closeModal();
+            const priv = types.find(t => /private/i.test(t.name));
+            bookingForm(null, props, types, guests, { onSaved: () => setView('calendar'), prefill: { property_id: Number(d.property_id), check_in: d.from, check_out: d.to, amount: q.total, booking_type_id: priv ? priv.id : null } });
+          } }, 'Create private booking →')));
+      } catch (err) { result.innerHTML = ''; result.appendChild(el('div', { class: 'login-err' }, err.message || 'Could not get a quote')); }
+    });
+    wrap.appendChild(form); wrap.appendChild(result);
+    openModal('Private booking estimator', wrap);
   }
 
   // ---------- TO-DO TASKS ----------
@@ -1356,23 +1398,24 @@
 
   function bookingForm(b, props, types, guests, opts) {
     const onSaved = (opts && opts.onSaved) || (() => setView('bookings'));
+    const pf = b || (opts && opts.prefill) || {}; // prefill values for a new booking
     const form = el('form', { class: 'form-grid' });
     const propOpts = props.map(p => ({ value: String(p.id), label: p.nickname }));
     const typeOpts = [{ value: '', label: '— none —' }].concat(types.map(t => ({ value: String(t.id), label: t.name })));
     const guestOpts = [{ value: '', label: '— new guest below —' }].concat(guests.map(g => ({ value: String(g.id), label: g.name + (g.email ? ` <${g.email}>` : '') })));
 
-    form.appendChild(formField('Property *', select('property_id', propOpts, b?.property_id)));
-    form.appendChild(formField('Booking type', select('booking_type_id', typeOpts, b?.booking_type_id || '')));
-    form.appendChild(formField('Check-in *', input('check_in', { type: 'date', value: b?.check_in || (opts && opts.defaultDate) || isoToday(), required: true })));
-    form.appendChild(formField('Check-out', input('check_out', { type: 'date', value: b?.check_out })));
-    form.appendChild(formField('Amount', input('amount', { type: 'number', value: b?.amount || '', step: '0.01' })));
-    form.appendChild(formField('Existing guest', select('guest_id', guestOpts, b?.guest_id || '')));
-    form.appendChild(formField('Contact name (free text)', input('contact_name', { value: b?.contact_name, placeholder: 'name on the booking' })));
+    form.appendChild(formField('Property *', select('property_id', propOpts, pf.property_id)));
+    form.appendChild(formField('Booking type', select('booking_type_id', typeOpts, pf.booking_type_id || '')));
+    form.appendChild(formField('Check-in *', input('check_in', { type: 'date', value: pf.check_in || (opts && opts.defaultDate) || isoToday(), required: true })));
+    form.appendChild(formField('Check-out', input('check_out', { type: 'date', value: pf.check_out })));
+    form.appendChild(formField('Amount', input('amount', { type: 'number', value: pf.amount || '', step: '0.01' })));
+    form.appendChild(formField('Existing guest', select('guest_id', guestOpts, pf.guest_id || '')));
+    form.appendChild(formField('Contact name (free text)', input('contact_name', { value: pf.contact_name, placeholder: 'name on the booking' })));
     form.appendChild(formField('+ New guest name', input('new_guest_name', { value: '', placeholder: 'optional' })));
     form.appendChild(formField('+ New guest email', input('new_guest_email', { type: 'email' })));
     form.appendChild(formField('+ New guest phone', input('new_guest_phone')));
-    form.appendChild(formField('Door code', input('door_code', { value: b?.door_code, placeholder: 'sent in pre-arrival message' })));
-    form.appendChild(formField('Notes', textarea('notes', b?.notes), { full: true }));
+    form.appendChild(formField('Door code', input('door_code', { value: pf.door_code, placeholder: 'sent in pre-arrival message' })));
+    form.appendChild(formField('Notes', textarea('notes', pf.notes), { full: true }));
     let cancelCb = null;
     if (b) {
       cancelCb = el('input', { type: 'checkbox', style: 'width:auto;' }); cancelCb.checked = b.status === 'cancelled';
