@@ -962,6 +962,15 @@ function parseGuestFromSummary(summary) {
   const m = s.match(/^(?:reserved|reservation)\s*[-–—:]\s*(.+)$/i);
   return m ? m[1].trim() : '';
 }
+// Loose name comparison so "Kaileigh" matches "Kaileigh Smith" but not "Gina".
+function namesMatch(a, b) {
+  const norm = x => (x || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
+  const na = norm(a), nb = norm(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const fa = na.split(/\s+/)[0], fb = nb.split(/\s+/)[0];
+  return na.startsWith(nb) || nb.startsWith(na) || (fa.length > 2 && fa === fb);
+}
 function addDays(iso, n) {
   const d = new Date(iso + 'T00:00:00Z');
   d.setUTCDate(d.getUTCDate() + n);
@@ -1013,6 +1022,7 @@ function buildCalendarEvents() {
     title: `${b.property_name || 'Property'} — ${b.guest_name || b.contact_name || 'Booking'}`,
     start: b.check_in, end: b.check_out || b.check_in,
     source: b.booking_type_name || 'Manual', amount: b.amount,
+    source_uid: b.source_uid || null,
     platform_verified: false, synced_source: null,
   }));
   events.push(...bookingEvents);
@@ -1022,17 +1032,23 @@ function buildCalendarEvents() {
   // Reserved synced events → merge into a matching booking, else surface as "needs details".
   const claimedSpans = [];
   for (const s of synced.filter(e => e._class === 'reserved')) {
-    let match = bookingEvents.find(b => b.property_id === s.property_id &&
-      b.start === s.start_date && (b.end || b.start) === s.end_date);
-    if (!match) match = bookingEvents.find(b => b.property_id === s.property_id &&
-      rangesOverlap(b.start, b.end, s.start_date, s.end_date));
+    const guestName = parseGuestFromSummary(s.summary);
+    const atProp = bookingEvents.filter(b => b.property_id === s.property_id);
+    // Match a platform reservation to a booking only when it's plausibly the SAME
+    // reservation — never absorb it into an unrelated booking that merely overlaps.
+    // Priority: linked UID → exact date span → overlap with a matching guest name.
+    let match = atProp.find(b => b.source_uid && s.uid && b.source_uid === s.uid);
+    if (!match) match = atProp.find(b => b.start === s.start_date && (b.end || b.start) === s.end_date);
+    if (!match && guestName) match = atProp.find(b =>
+      rangesOverlap(b.start, b.end, s.start_date, s.end_date) &&
+      namesMatch(guestName, b.guest_name || b.contact_name));
     if (match) {
       match.platform_verified = true;
       match.synced_source = s.source;
       claimedSpans.push({ property_id: s.property_id, start: s.start_date, end: s.end_date });
     } else {
       const p = tableFind('properties', s.property_id);
-      const guest = parseGuestFromSummary(s.summary);
+      const guest = guestName;
       events.push({
         kind: 'reserved', id: 's' + s.id, synced_event_id: s.id,
         property_id: s.property_id, property_name: p?.nickname || null,
