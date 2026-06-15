@@ -1014,7 +1014,9 @@ function mergeBlocks(blocks) {
 // Returns a flat, de-duplicated, flagged list of calendar entries.
 function buildCalendarEvents() {
   const events = [];
-  const bookingEvents = tableAll('bookings').map(joinBooking).map(b => ({
+  // Cancelled bookings are kept in the DB (for history/revenue records) but must not
+  // occupy the calendar, claim synced reservations, or trip conflict detection.
+  const bookingEvents = tableAll('bookings').filter(b => b.status !== 'cancelled').map(joinBooking).map(b => ({
     kind: 'booking', id: 'b' + b.id, booking_id: b.id,
     property_id: b.property_id, property_name: b.property_name,
     guest_name: b.guest_name || b.contact_name || null,
