@@ -1029,7 +1029,17 @@ function buildCalendarEvents() {
   }));
   events.push(...bookingEvents);
 
-  const synced = tableAll('synced_events').map(s => ({ ...s, _class: classifySynced(s.summary) }));
+  // "Override" a platform reservation: a cancelled booking that was claimed from a synced
+  // Airbnb/VRBO event (linked by source_uid) voids that event — e.g. the guest was moved to
+  // another property but the stay was never cancelled on the platform. Suppress it so it
+  // doesn't resurface as a "needs details" entry or a block. Keyed by UID so it survives
+  // re-syncs (synced_events are wiped/re-inserted each sync, but the UID is stable).
+  const voidedUids = new Set(
+    tableAll('bookings').filter(b => b.status === 'cancelled' && b.source_uid).map(b => b.source_uid)
+  );
+  const synced = tableAll('synced_events')
+    .filter(s => !voidedUids.has(s.uid))
+    .map(s => ({ ...s, _class: classifySynced(s.summary) }));
 
   // Reserved synced events → merge into a matching booking, else surface as "needs details".
   const claimedSpans = [];
