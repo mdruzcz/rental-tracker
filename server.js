@@ -667,8 +667,38 @@ function joinCleanerTask(t) {
     guest_name: g?.name || (b?.contact_name || null),
   };
 }
+function daysBetweenIso(a, b) {
+  return Math.round((Date.parse(b) - Date.parse(a)) / 86400000);
+}
+// Upcoming guest stays from the reconciled calendar — excludes cancelled bookings and
+// overridden platform reservations, and de-dupes cross-platform mirrors.
+function upcomingStays() {
+  return buildCalendarEvents()
+    .filter(e => e.kind === 'booking' || e.kind === 'reserved')
+    .map(e => ({ property_id: e.property_id, start: e.start }));
+}
+// "Clean by" = the next stay's check-in at this property after the guest checks out — the
+// latest a cleaner can finish and still have the unit ready. null when nothing is booked next.
+function cleanByInfo(task, stays) {
+  stays = stays || upcomingStays();
+  const b = task.booking_id ? tableFind('bookings', task.booking_id) : null;
+  const anchor = (b && b.check_out) || task.due_date; // unit frees up at checkout
+  let cleanBy = null;
+  if (anchor) for (const s of stays) {
+    if (s.property_id !== task.property_id || !s.start || s.start < anchor) continue;
+    if (cleanBy === null || s.start < cleanBy) cleanBy = s.start;
+  }
+  return {
+    clean_by: cleanBy,
+    same_day_turnover: !!(cleanBy && anchor && cleanBy === anchor),
+    clean_window_days: (cleanBy && anchor) ? daysBetweenIso(anchor, cleanBy) : null,
+  };
+}
 app.get('/api/cleaner-tasks', (req, res) => {
-  ok(res, tableAll('cleaner_tasks').map(joinCleanerTask).sort((a, b) => (a.due_date || '').localeCompare(b.due_date || '')));
+  const stays = upcomingStays();
+  ok(res, tableAll('cleaner_tasks')
+    .map(t => ({ ...joinCleanerTask(t), ...cleanByInfo(t, stays) }))
+    .sort((a, b) => (a.due_date || '').localeCompare(b.due_date || '')));
 });
 app.post('/api/cleaner-tasks', (req, res) => {
   const { cleaner_id, property_id, due_date, notes, booking_id, status } = req.body || {};
@@ -714,8 +744,14 @@ app.post('/api/cleaner-tasks/:id/notify', async (req, res) => {
     const propName = property ? property.nickname : 'a property';
     const dueDate = task.due_date || 'TBD';
     const taskNotes = task.notes ? `\nNotes: ${task.notes}` : '';
+    const { clean_by, same_day_turnover } = cleanByInfo(task);
+    const deadline = clean_by
+      ? (same_day_turnover
+          ? `\n⚠ SAME-DAY turnaround — must be ready by check-in on ${clean_by}.`
+          : `\nMust be ready by ${clean_by} (next guest checks in).`)
+      : '';
 
-    const body = `Hi ${cleaner.name}, you have a cleaning scheduled at ${propName} on ${dueDate}.${taskNotes}\n\nPlease confirm when you're available. Thanks!`;
+    const body = `Hi ${cleaner.name}, you have a cleaning scheduled at ${propName} on ${dueDate}.${deadline}${taskNotes}\n\nPlease confirm when you're available. Thanks!`;
 
     const message = await twilioClient.messages.create({
       body,

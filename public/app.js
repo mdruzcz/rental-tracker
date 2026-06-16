@@ -1929,12 +1929,29 @@
       evs.forEach(t => {
         if (t.due_date !== iso) return;
         const color = colorOf(t.cleaner_id);
+        const sameDay = t.same_day_turnover;
+        const deadlineLine = t.clean_by
+          ? (sameDay ? '⚠ same-day turn' : 'clean by ' + fmtDate(t.clean_by))
+          : 'no next booking';
+        const tip = `${t.cleaner_name} → ${t.property_name}\n`
+          + `Guest checkout: ${fmtDate(t.booking_check_out || t.due_date)}\n`
+          + (t.clean_by
+              ? `Clean by: ${fmtDate(t.clean_by)} — next guest checks in`
+                + (sameDay ? ' (SAME-DAY TURNAROUND!)' : ` (${t.clean_window_days}-day window)`)
+              : 'No upcoming booking — flexible')
+          + (t.notes ? '\n' + t.notes : '');
         const ev = el('span', {
           class: 'cal-event cleaning' + (t.status === 'done' ? ' done' : ''),
-          style: `background:${color}22; color:${color}; border-left:3px solid ${color}; padding-left:5px;`,
-          title: `${t.cleaner_name} → ${t.property_name} (booking ${fmtDate(t.booking_check_in)} → ${fmtDate(t.booking_check_out)})${t.notes ? '\n' + t.notes : ''}`,
+          style: `background:${color}22; color:${color}; border-left:3px solid ${sameDay ? 'var(--danger)' : color}; padding-left:5px;`,
+          title: tip,
           onclick: () => cleanerTaskForm(t, cleaners, props),
-        }, `🧹 ${t.cleaner_name}: ${t.property_name}`);
+        },
+          el('span', null, `🧹 ${t.cleaner_name}: ${t.property_name}`),
+          el('span', {
+            style: 'display:block;font-size:.78em;opacity:.9;'
+              + (sameDay ? 'color:var(--danger);font-weight:700;opacity:1;' : ''),
+          }, deadlineLine),
+        );
         cell.appendChild(ev);
       });
       return cell;
@@ -1958,6 +1975,17 @@
       form.appendChild(el('p', { class: 'muted', style: 'grid-column: 1/-1; font-size:12px;' },
         `Linked to booking: ${fmtDate(t.booking_check_in)} → ${fmtDate(t.booking_check_out)}, guest ${t.guest_name || '—'}`
       ));
+    }
+    if (t && (t.clean_by || t.clean_by === null)) {
+      const sameDay = t.same_day_turnover;
+      form.appendChild(el('p', {
+        style: 'grid-column: 1/-1; font-size:12px;'
+          + (sameDay ? 'color:var(--danger);font-weight:700;' : 'color:var(--muted);'),
+      }, t.clean_by
+          ? (sameDay
+              ? `⚠ Clean by ${fmtDate(t.clean_by)} — SAME-DAY turnaround, next guest checks in that day.`
+              : `🧽 Clean by ${fmtDate(t.clean_by)} — next guest checks in (${t.clean_window_days}-day window).`)
+          : '🧽 No upcoming booking at this property — clean any time.'));
     }
 
     const buttons = el('div', { class: 'btn-row', style: 'grid-column: 1/-1; margin-top: 8px;' },
