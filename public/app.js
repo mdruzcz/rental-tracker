@@ -319,7 +319,12 @@
     try {
       const out = await API.syncAll();
       const total = out.reduce((acc, p) => acc + (p.results || []).reduce((a, r) => a + (r.count || 0), 0), 0);
+      const cancelled = out.flatMap(p => (p.cancelled || []).map(c => ({ ...c, nickname: p.nickname })));
       toast(`Sync complete: ${total} events imported`, 'success');
+      if (cancelled.length) {
+        const names = cancelled.map(c => `${c.contact_name || 'Guest'} (${c.nickname})`).join(', ');
+        toast(`Auto-cancelled ${cancelled.length} booking${cancelled.length > 1 ? 's' : ''} removed from the platform: ${names}`, 'error');
+      }
       const active = $('.tab.active').dataset.view;
       setView(active);
     } catch (e) {}
@@ -651,7 +656,7 @@
         el('td', null, el('div', { class: 'btn-row' },
           el('button', { class: 'btn-ghost', onclick: async () => {
             toast('Syncing ' + p.nickname + '...');
-            try { const r = await API.sync(p.id); const n = (r.results||[]).reduce((a,x)=>a+(x.count||0),0); toast(`Imported ${n} events`, 'success'); }
+            try { const r = await API.sync(p.id); const n = (r.results||[]).reduce((a,x)=>a+(x.count||0),0); toast(`Imported ${n} events`, 'success'); if ((r.cancelled||[]).length) toast(`Auto-cancelled ${r.cancelled.length} booking(s) removed from the platform: ${r.cancelled.map(c=>c.contact_name||'Guest').join(', ')}`, 'error'); }
             catch (e) {}
           }}, 'Sync'),
           el('button', { class: 'btn-ghost', onclick: () => propertyForm(p, cleaners) }, 'Edit'),

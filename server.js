@@ -942,28 +942,55 @@ async function fetchAndStoreIcal(property, source, url) {
     if (error) throw error;
   }, `clear synced_events property ${property.id} ${source}`);
   let count = 0;
+  const uids = [];
   for (const k of Object.keys(events)) {
     const e = events[k];
     if (!e || e.type !== 'VEVENT') continue;
     const start = e.start ? new Date(e.start).toISOString().slice(0, 10) : null;
     const end = e.end ? new Date(e.end).toISOString().slice(0, 10) : null;
     if (!start) continue;
+    const uid = e.uid || k;
+    uids.push(uid);
     tableInsert('synced_events', {
-      property_id: property.id, source, uid: e.uid || k, summary: e.summary || '',
+      property_id: property.id, source, uid, summary: e.summary || '',
       start_date: start, end_date: end, last_synced: nowIso(),
     });
     count++;
   }
-  return { source, count };
+  return { source, count, uids };
+}
+// When a guest cancels on Airbnb/VRBO, the platform simply drops the reservation from its
+// feed. A booking that was *claimed* from that reservation (linked by source_uid) would
+// otherwise linger forever, since sync only manages synced_events. Here we reconcile: any
+// confirmed, future booking whose platform reservation has vanished from the freshly-fetched
+// feed is auto-cancelled (reversible — kept in the DB, just hidden from the calendar).
+const claimedPlatformOf = (uid) => /airbnb/i.test(uid || '') ? 'airbnb' : 'vrbo';
+function reconcileVanishedReservations(property, fetchedBySource) {
+  const todayIso = nowIso().slice(0, 10);
+  const cancelled = [];
+  for (const b of tableAll('bookings')) {
+    if (b.property_id !== property.id) continue;
+    if (!b.source_uid || b.status === 'cancelled') continue;
+    if ((b.check_out || b.check_in) < todayIso) continue;          // only future stays
+    const fset = fetchedBySource[claimedPlatformOf(b.source_uid)]; // platform we fetched
+    if (!fset) continue;                                           // that feed wasn't fetched — leave it
+    if (fset.has(b.source_uid)) continue;                         // still on the platform — keep
+    tableUpdate('bookings', b.id, { status: 'cancelled' });
+    removeCleanerTaskForBooking(b.id);
+    cancelled.push({ id: b.id, contact_name: b.contact_name, check_in: b.check_in, check_out: b.check_out });
+  }
+  return cancelled;
 }
 app.post('/api/sync/:propertyId', async (req, res) => {
   const property = tableFind('properties', req.params.propertyId);
   if (!property) return err(res, 404, 'property not found');
   try {
     const results = [];
-    if (property.airbnb_ical_url) results.push(await fetchAndStoreIcal(property, 'airbnb', property.airbnb_ical_url));
-    if (property.vrbo_ical_url) results.push(await fetchAndStoreIcal(property, 'vrbo', property.vrbo_ical_url));
-    ok(res, { property_id: property.id, results });
+    const fetched = {};
+    if (property.airbnb_ical_url) { const r = await fetchAndStoreIcal(property, 'airbnb', property.airbnb_ical_url); results.push(r); fetched.airbnb = new Set(r.uids || []); }
+    if (property.vrbo_ical_url) { const r = await fetchAndStoreIcal(property, 'vrbo', property.vrbo_ical_url); results.push(r); fetched.vrbo = new Set(r.uids || []); }
+    const cancelled = reconcileVanishedReservations(property, fetched);
+    ok(res, { property_id: property.id, results, cancelled });
   } catch (e) { err(res, 500, 'Sync failed: ' + e.message); }
 });
 app.post('/api/sync-all', async (req, res) => {
@@ -971,9 +998,11 @@ app.post('/api/sync-all', async (req, res) => {
   for (const p of tableAll('properties')) {
     try {
       const r = [];
-      if (p.airbnb_ical_url) r.push(await fetchAndStoreIcal(p, 'airbnb', p.airbnb_ical_url));
-      if (p.vrbo_ical_url) r.push(await fetchAndStoreIcal(p, 'vrbo', p.vrbo_ical_url));
-      out.push({ property_id: p.id, nickname: p.nickname, results: r });
+      const fetched = {};
+      if (p.airbnb_ical_url) { const x = await fetchAndStoreIcal(p, 'airbnb', p.airbnb_ical_url); r.push(x); fetched.airbnb = new Set(x.uids || []); }
+      if (p.vrbo_ical_url) { const x = await fetchAndStoreIcal(p, 'vrbo', p.vrbo_ical_url); r.push(x); fetched.vrbo = new Set(x.uids || []); }
+      const cancelled = reconcileVanishedReservations(p, fetched);
+      out.push({ property_id: p.id, nickname: p.nickname, results: r, cancelled });
     } catch (e) { out.push({ property_id: p.id, nickname: p.nickname, error: e.message }); }
   }
   ok(res, out);
