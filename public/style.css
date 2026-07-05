@@ -612,3 +612,26 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .cal-compare-strip.behind { background: var(--danger-soft); border-color: var(--danger); }
 .cal-compare-strip.behind strong { color: var(--danger-ink); }
 @media (max-width: 900px) { .cal-compare { grid-template-columns: 1fr; } }
+
+/* ---------- Annual ROI / cash-on-cash P&L ---------- */
+.roi-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 20px; margin-top: 10px; }
+.roi-pnl, .roi-fin { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; }
+.roi-pnl h3, .roi-fin h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 6px; }
+.roi-pnl .stat-line { padding: 4px 0; border-bottom: 1px dashed var(--border); }
+.roi-pnl .stat-line:last-child { border-bottom: none; }
+.stat-line.roi-total { border-top: 1px solid var(--border-strong); font-weight: 700; }
+.stat-line.roi-total span { color: var(--text); }
+.stat-line.roi-grand { border-top: 2px solid var(--border-strong); font-size: 15px; font-weight: 750; }
+.stat-line.roi-grand span { color: var(--text); }
+.stat-line.roi-grand.pos strong { color: var(--success-ink); }
+.stat-line.roi-grand.neg strong { color: var(--danger-ink); }
+.stat-line.roi-edit { align-items: center; gap: 10px; }
+.stat-line.roi-edit input { flex: 0 0 auto; padding: 4px 8px; font-size: 13px; }
+.kpi-mini-row { display: flex; gap: 14px; flex-wrap: wrap; }
+.roi-mini { text-align: right; }
+.roi-mini .label { font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.roi-mini .value { font-size: 18px; font-weight: 750; font-variant-numeric: tabular-nums; }
+.roi-mini.success .value { color: var(--success-ink); }
+.roi-mini.warn .value { color: var(--warning-ink); }
+.roi-mini.danger .value { color: var(--danger-ink); }
+@media (max-width: 900px) { .roi-grid { grid-template-columns: 1fr; } }

@@ -2274,6 +2274,175 @@ app.put('/api/properties/:id/listing-meta', (req, res) => {
   ok(res, meta);
 });
 
+// ---------- ANNUAL ROI / CASH-ON-CASH P&L ----------
+// Buildings group properties that share one mortgage/tax bill (Retreat + Hideaway are
+// both 4488 East Road). Inputs are saved in settings key `roi_<year>`; STR revenue and
+// app-tracked operating costs are pulled live from bookings/expenses. No new tables.
+const ROI_BUILDINGS = [
+  { key: '4488-east-road', name: '4488 East Road', sub: 'Retreat + Hideaway', nicknames: ['Retreat', 'Hideaway'] },
+  { key: '4490-east-road', name: '4490 East Road', sub: 'Escape', nicknames: ['Escape'] },
+  { key: '479-george-street', name: '479 George Street', sub: 'Look Out', nicknames: ['Look Out'] },
+];
+const ROI_EXPENSE_ITEMS = [
+  ['insurance', 'Insurance'],
+  ['property_taxes', 'Property taxes'],
+  ['maintenance', 'Maintenance & repairs'],
+  ['electricity', 'Electricity'],
+  ['natural_gas', 'Natural gas'],
+  ['water', 'Water'],
+  ['internet', 'Internet'],
+  ['str_license', 'Short-term rental license'],
+  ['management', 'Management & admin'],
+  ['other_expense', 'Other expenses'],
+];
+// Seed values: 2025 actuals from Matt's "Real Estate Summary" workbook; 2026 carries the
+// recurring costs forward. 479 George is new — utility/insurance/tax/license figures are
+// ESTIMATES (flagged in notes) until real bills replace them.
+const ROI_SEEDS = {
+  2025: {
+    '4488-east-road': {
+      insurance: 1412.05, property_taxes: 5365.67, maintenance: 2948.36,
+      electricity: 2127.67, natural_gas: 994.07, water: 1533.95, internet: 816.87,
+      str_license: 0, management: 0, other_expense: 316.17,
+      other_income: 49175, other_income_note: 'Long-term rent (tenant year)',
+      property_value: 700000, debt_balance: 400534, mortgage_rate_pct: 5.33,
+      mortgage_interest_override: 21344.72, cash_invested: 0, ownership_pct: 50,
+      notes: '2025 actuals from the Real Estate Summary workbook. Interest is the actual $21,344.72 paid.',
+    },
+    '4490-east-road': {
+      insurance: 1035, property_taxes: 1311.55, maintenance: 538.81,
+      electricity: 594.14, natural_gas: 269.76, water: 725.05, internet: 395.21,
+      str_license: 0, management: 0, other_expense: 0,
+      other_income: 0, other_income_note: '',
+      property_value: 550000, debt_balance: 247624.54, mortgage_rate_pct: 4.65,
+      mortgage_interest_override: 4649.54, cash_invested: 0, ownership_pct: 100,
+      notes: '2025 actuals (renovation year — interest $4,649.54 was a partial year).',
+    },
+    '479-george-street': {
+      insurance: 0, property_taxes: 0, maintenance: 0, electricity: 0, natural_gas: 0,
+      water: 0, internet: 0, str_license: 0, management: 0, other_expense: 0,
+      other_income: 0, other_income_note: '', property_value: 0, debt_balance: 0,
+      mortgage_rate_pct: 0, mortgage_interest_override: 0, cash_invested: 0, ownership_pct: 100,
+      notes: 'Not owned/operated in 2025.',
+    },
+  },
+  2026: {
+    '4488-east-road': {
+      insurance: 1450, property_taxes: 5500, maintenance: 3000,
+      electricity: 2200, natural_gas: 1000, water: 1550, internet: 820,
+      str_license: 0, management: 0, other_expense: 0,
+      other_income: 0, other_income_note: 'Add any long-term rent collected before the June 2026 STR switch',
+      property_value: 700000, debt_balance: 400534, mortgage_rate_pct: 5.33,
+      mortgage_interest_override: 0, cash_invested: 0, ownership_pct: 50,
+      notes: 'Recurring costs carried from 2025 actuals (rounded). Interest computed from balance × rate.',
+    },
+    '4490-east-road': {
+      insurance: 1050, property_taxes: 1350, maintenance: 600,
+      electricity: 1200, natural_gas: 550, water: 900, internet: 480,
+      str_license: 0, management: 0, other_expense: 0,
+      other_income: 0, other_income_note: '',
+      property_value: 550000, debt_balance: 247624.54, mortgage_rate_pct: 4.65,
+      mortgage_interest_override: 0, cash_invested: 0, ownership_pct: 100,
+      notes: 'Utilities scaled up from the 2025 part-year actuals to a full operating year (estimates).',
+    },
+    '479-george-street': {
+      insurance: 2400, property_taxes: 3200, maintenance: 1200,
+      electricity: 1800, natural_gas: 1000, water: 900, internet: 720,
+      str_license: 750, management: 0, other_expense: 0,
+      other_income: 0, other_income_note: '',
+      property_value: 0, debt_balance: 0, mortgage_rate_pct: 0,
+      mortgage_interest_override: 0, cash_invested: 0, ownership_pct: 100,
+      notes: 'ALL EXPENSE LINES ARE ESTIMATES (new property, listed July 2026) — replace with real bills. Fill in property value, mortgage balance and rate to complete the return calc.',
+    },
+  },
+};
+function getRoiInputs(year) {
+  const saved = getSetting('roi_' + year, null) || {};
+  const seed = ROI_SEEDS[year] || ROI_SEEDS[2026] || {};
+  const out = {};
+  for (const b of ROI_BUILDINGS) {
+    out[b.key] = { ...(seed[b.key] || {}), ...(saved[b.key] || {}) };
+  }
+  return out;
+}
+function computeRoi(year) {
+  const inputs = getRoiInputs(year);
+  const yStart = `${year}-01-01`, yEnd = `${year}-12-31`;
+  const bookings = tableAll('bookings').map(joinBooking)
+    .filter(b => b.status !== 'cancelled' && b.check_in >= yStart && b.check_in <= yEnd);
+  const expenses = tableAll('expenses').filter(e => (e.date || '') >= yStart && (e.date || '') <= yEnd);
+  const props = tableAll('properties');
+  const num = v => Number(v) || 0;
+
+  const buildings = ROI_BUILDINGS.map(b => {
+    const inp = inputs[b.key] || {};
+    const propIds = props.filter(p => b.nicknames.some(n => (p.nickname || '').toLowerCase() === n.toLowerCase())).map(p => p.id);
+    const bs = bookings.filter(x => propIds.includes(x.property_id));
+    const str_gross = +bs.reduce((a, x) => a + (x.amount || 0) + (x.upsell_total || 0), 0).toFixed(2);
+    const platform_fees = +bs.reduce((a, x) => a + (x.platform_fee || 0), 0).toFixed(2);
+    const str_net = +(str_gross - platform_fees).toFixed(2);
+    const tracked_costs = +expenses.filter(e => propIds.includes(e.property_id)).reduce((a, e) => a + (e.amount || 0), 0).toFixed(2);
+
+    const line_items = ROI_EXPENSE_ITEMS.map(([k, label]) => ({ key: k, label, amount: num(inp[k]) }));
+    const input_opex = +line_items.reduce((a, li) => a + li.amount, 0).toFixed(2);
+    const other_income = num(inp.other_income);
+    const total_income = +(str_net + other_income).toFixed(2);
+    const total_opex = +(input_opex + tracked_costs).toFixed(2);
+    const noi = +(total_income - total_opex).toFixed(2);
+
+    const debt = num(inp.debt_balance);
+    const rate = num(inp.mortgage_rate_pct);
+    const override = num(inp.mortgage_interest_override);
+    const mortgage_interest = +(override > 0 ? override : debt * rate / 100).toFixed(2);
+    const cash_flow = +(noi - mortgage_interest).toFixed(2);
+
+    const value = num(inp.property_value);
+    const equity = +(value - debt).toFixed(2);
+    const cashBase = num(inp.cash_invested) > 0 ? num(inp.cash_invested) : equity;
+    const ownership = num(inp.ownership_pct) > 0 ? num(inp.ownership_pct) / 100 : 1;
+    return {
+      key: b.key, name: b.name, sub: b.sub, property_ids: propIds,
+      inputs: inp,
+      computed: {
+        str_gross, platform_fees, str_net, tracked_costs, other_income,
+        total_income, input_opex, total_opex, noi,
+        mortgage_interest, interest_source: override > 0 ? 'actual (override)' : 'balance × rate',
+        cash_flow, equity,
+        cap_rate: value > 0 ? +(noi / value).toFixed(4) : null,
+        cash_on_cash: cashBase > 0 ? +(cash_flow / cashBase).toFixed(4) : null,
+        cash_basis: num(inp.cash_invested) > 0 ? 'cash invested' : 'equity (value − debt)',
+        ownership_pct: ownership * 100,
+        your_cash_flow: +(cash_flow * ownership).toFixed(2),
+      },
+    };
+  });
+  const totals = {
+    cash_flow: +buildings.reduce((a, b) => a + b.computed.cash_flow, 0).toFixed(2),
+    your_cash_flow: +buildings.reduce((a, b) => a + b.computed.your_cash_flow, 0).toFixed(2),
+    noi: +buildings.reduce((a, b) => a + b.computed.noi, 0).toFixed(2),
+    total_income: +buildings.reduce((a, b) => a + b.computed.total_income, 0).toFixed(2),
+  };
+  return { year, expense_items: ROI_EXPENSE_ITEMS.map(([key, label]) => ({ key, label })), buildings, totals };
+}
+app.get('/api/roi', (req, res) => {
+  const year = Number(req.query.year) || new Date().getFullYear();
+  ok(res, computeRoi(year));
+});
+app.put('/api/roi', (req, res) => {
+  const b = req.body || {};
+  const year = Number(b.year) || new Date().getFullYear();
+  const incoming = b.buildings || {};
+  const key = 'roi_' + year;
+  const current = getSetting(key, null) || {};
+  const merged = { ...current };
+  for (const bld of ROI_BUILDINGS) {
+    if (incoming[bld.key]) merged[bld.key] = { ...(current[bld.key] || {}), ...incoming[bld.key] };
+  }
+  const existing = store.settings.find(s => s.key === key);
+  if (existing) tableUpdate('settings', existing.id, { value: merged }); else tableInsert('settings', { key, value: merged });
+  ok(res, computeRoi(year));
+});
+
 // ---------- INSIGHTS ----------
 // Rule-based, data-driven recommendations per property. severity: 'act' | 'watch' | 'good'.
 function computeInsights() {
@@ -2334,7 +2503,34 @@ function computeInsights() {
 
     out.push({ id: s.id, nickname: s.nickname, stats: s, insights: tips });
   }
-  return { generated_at: nowIso(), today, properties: out };
+
+  // Building-level P&L insights (annual ROI / cash-on-cash view).
+  const roi = computeRoi(Number(today.slice(0, 4)));
+  const buildings = roi.buildings.map(b => {
+    const c = b.computed, tips = [];
+    const fmt$ = n => '$' + Math.round(n).toLocaleString('en-CA');
+    if (!b.property_ids.length) return null;
+
+    if (c.total_income > 0 && c.cash_flow < 0) {
+      tips.push({ severity: 'act', title: `Cash-flow negative: ${fmt$(c.cash_flow)} this year so far`, detail: `Income ${fmt$(c.total_income)} minus operating costs ${fmt$(c.total_opex)} and mortgage interest ${fmt$(c.mortgage_interest)} leaves a shortfall. Check the ROI tab: either revenue needs to catch up over the season or a cost line is out of proportion.` });
+    } else if (c.cash_flow > 0 && c.cash_on_cash != null) {
+      const pct = Math.round(c.cash_on_cash * 1000) / 10;
+      const sev = c.cash_on_cash >= 0.08 ? 'good' : 'watch';
+      tips.push({ severity: sev, title: `${pct}% cash-on-cash return (${c.cash_basis})`, detail: `${fmt$(c.cash_flow)} annual cash flow on ${fmt$(Number(b.inputs.cash_invested) > 0 ? Number(b.inputs.cash_invested) : c.equity)} ${c.cash_basis}. ${c.cash_on_cash >= 0.08 ? 'Above the ~8% bar most investors want from active STRs.' : 'Below the ~8% most investors target for the work an STR takes — push occupancy or trim the biggest cost line.'}` });
+    }
+    if (c.total_income > 0 && c.mortgage_interest > 0 && c.mortgage_interest / c.total_income > 0.4) {
+      tips.push({ severity: 'watch', title: `Mortgage interest eats ${Math.round(c.mortgage_interest / c.total_income * 100)}% of income`, detail: `${fmt$(c.mortgage_interest)} of interest against ${fmt$(c.total_income)} income (${c.interest_source}). Refinancing or paying down principal moves this number more than any nightly-rate tweak.` });
+    }
+    if (!Number(b.inputs.property_value) || (!Number(b.inputs.debt_balance) && !Number(b.inputs.mortgage_interest_override))) {
+      tips.push({ severity: 'watch', title: 'P&L incomplete — missing value or mortgage inputs', detail: `Fill in property value, mortgage balance and rate on the ROI tab so cap rate and cash-on-cash can be computed. ${(b.inputs.notes || '').includes('ESTIMATE') ? 'Expense lines are currently estimates.' : ''}` });
+    }
+    if (!Number(b.inputs.str_license)) {
+      tips.push({ severity: 'watch', title: 'No STR license cost entered', detail: 'Licensing is coming for Central Elgin STRs — add the expected annual license fee so the return numbers stay honest.' });
+    }
+    return { key: b.key, name: b.name, sub: b.sub, computed: c, insights: tips };
+  }).filter(Boolean);
+
+  return { generated_at: nowIso(), today, properties: out, buildings, roi_year: roi.year };
 }
 app.get('/api/insights', (req, res) => ok(res, computeInsights()));
 

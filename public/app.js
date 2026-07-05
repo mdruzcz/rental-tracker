@@ -204,6 +204,7 @@
     financials: (year, propertyId) => api('GET', '/api/financials?' + new URLSearchParams({ ...(year ? { year } : {}), ...(propertyId ? { property_id: propertyId } : {}) })),
     propertyStats: () => api('GET', '/api/property-stats'),
     insights: () => api('GET', '/api/insights'),
+    roi: { get: (year) => api('GET', '/api/roi' + (year ? '?year=' + year : '')), save: (b) => api('PUT', '/api/roi', b) },
     listingMeta: (id, b) => api('PUT', `/api/properties/${id}/listing-meta`, b),
     orphans: () => api('GET', '/api/orphans'),
     messageTemplates: { list: () => api('GET', '/api/message-templates'), update: (id, b) => api('PUT', `/api/message-templates/${id}`, b) },
@@ -284,7 +285,7 @@
 
   // ---------- router ----------
   const VIEWS = {};
-  const TOOL_VIEWS = new Set(['ltr', 'annual', 'pricing', 'requests', 'todos', 'guests', 'bulk', 'mailing', 'maintenance', 'cleanerCal', 'licensing', 'smsInbox', 'expenses', 'messaging', 'reviews', 'upsellCatalog', 'settings', 'cleaners']);
+  const TOOL_VIEWS = new Set(['ltr', 'annual', 'roi', 'pricing', 'requests', 'todos', 'guests', 'bulk', 'mailing', 'maintenance', 'cleanerCal', 'licensing', 'smsInbox', 'expenses', 'messaging', 'reviews', 'upsellCatalog', 'settings', 'cleaners']);
   function setView(name) {
     $$('.tab').forEach(b => {
       if (b.classList.contains('tools-toggle')) {
@@ -2801,6 +2802,113 @@ Matt`;
     openModal('Channel fees', form);
   }
 
+  // ---------- ANNUAL ROI / CASH-ON-CASH P&L ----------
+  let roiYear = new Date().getFullYear();
+  VIEWS.roi = async (root) => {
+    const data = await API.roi.get(roiYear);
+    const yearSel = select('ry', (() => { const o = []; const cy = new Date().getFullYear(); for (let y = cy + 1; y >= cy - 3; y--) o.push({ value: String(y), label: String(y) }); return o; })(), String(roiYear));
+    yearSel.style.width = 'auto';
+    yearSel.addEventListener('change', () => { roiYear = Number(yearSel.value); setView('roi'); });
+    root.appendChild(el('div', { class: 'between' },
+      el('h1', null, `Annual ROI — ${data.year}`),
+      el('div', { style: 'display:flex;gap:8px;align-items:center;' }, el('span', { class: 'muted' }, 'Year'), yearSel)));
+    root.appendChild(el('div', { class: 'muted', style: 'margin:-8px 0 16px;font-size:13px;' },
+      'One P&L per building (Retreat + Hideaway share 4488 East Road). STR revenue and tracked expenses flow in automatically from bookings; enter the annual costs below and Save to update the return numbers.'));
+
+    root.appendChild(el('div', { class: 'kpi-grid' },
+      kpi('Portfolio cash flow', fmtMoney(data.totals.cash_flow), 'all buildings, full ownership', data.totals.cash_flow >= 0 ? 'success' : 'danger'),
+      kpi('Your share', fmtMoney(data.totals.your_cash_flow), 'after ownership splits', data.totals.your_cash_flow >= 0 ? 'success' : 'danger'),
+      kpi('Portfolio NOI', fmtMoney(data.totals.noi), 'before mortgage interest'),
+      kpi('Total income', fmtMoney(data.totals.total_income), 'STR net + other income'),
+    ));
+
+    for (const b of data.buildings) root.appendChild(roiBuildingCard(b, data));
+  };
+
+  function roiBuildingCard(b, data) {
+    const c = b.computed, inp = b.inputs || {};
+    const card = el('div', { class: 'card' });
+    card.appendChild(el('div', { class: 'between' },
+      el('div', null, el('h2', { style: 'margin-bottom:2px;' }, b.name), el('div', { class: 'muted', style: 'font-size:12px;' }, b.sub + (c.ownership_pct !== 100 ? ` • you own ${c.ownership_pct}%` : ''))),
+      el('div', { class: 'kpi-mini-row' },
+        roiMini('Cash flow', fmtMoney(c.cash_flow), c.cash_flow >= 0 ? 'success' : 'danger'),
+        roiMini('Cash-on-cash', c.cash_on_cash == null ? '—' : (c.cash_on_cash * 100).toFixed(1) + '%', c.cash_on_cash == null ? null : c.cash_on_cash >= 0.08 ? 'success' : 'warn'),
+        roiMini('Cap rate', c.cap_rate == null ? '—' : (c.cap_rate * 100).toFixed(1) + '%', null),
+        c.ownership_pct !== 100 ? roiMini('Your share', fmtMoney(c.your_cash_flow), c.your_cash_flow >= 0 ? 'success' : 'danger') : null)));
+    if (inp.notes) card.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin:4px 0 10px;font-style:italic;' }, '📝 ' + inp.notes));
+
+    const grid = el('div', { class: 'roi-grid' });
+
+    // Left: P&L (computed income + editable expense lines)
+    const pnl = el('div', { class: 'roi-pnl' });
+    const money = v => fmtMoney(v);
+    const roLine = (label, val, cls) => el('div', { class: 'stat-line ' + (cls || '') }, el('span', null, label), el('strong', null, money(val)));
+    pnl.appendChild(el('h3', null, 'Income'));
+    pnl.appendChild(roLine(`STR revenue (net of ${money(c.platform_fees)} fees)`, c.str_net));
+    const otherIncome = roiInput(inp.other_income);
+    pnl.appendChild(roiEditLine('Other income' + (inp.other_income_note ? ` — ${inp.other_income_note}` : ''), otherIncome));
+    pnl.appendChild(roLine('Total income', c.total_income, 'roi-total'));
+    pnl.appendChild(el('h3', { style: 'margin-top:12px;' }, 'Operating expenses'));
+    const itemInputs = {};
+    for (const it of data.expense_items) {
+      itemInputs[it.key] = roiInput(inp[it.key]);
+      pnl.appendChild(roiEditLine(it.label, itemInputs[it.key]));
+    }
+    pnl.appendChild(roLine('STR costs tracked in app (cleaning, supplies…)', c.tracked_costs));
+    pnl.appendChild(roLine('NOI (income − operating costs)', c.noi, 'roi-total'));
+    pnl.appendChild(roLine(`Mortgage interest (${c.interest_source})`, -c.mortgage_interest));
+    pnl.appendChild(roLine('Annual cash flow', c.cash_flow, 'roi-grand ' + (c.cash_flow >= 0 ? 'pos' : 'neg')));
+    grid.appendChild(pnl);
+
+    // Right: financing & return inputs
+    const fin = el('div', { class: 'roi-fin' });
+    fin.appendChild(el('h3', null, 'Financing & return basis'));
+    const value = roiInput(inp.property_value), debt = roiInput(inp.debt_balance);
+    const rate = roiInput(inp.mortgage_rate_pct, '0.01'), override = roiInput(inp.mortgage_interest_override);
+    const cash = roiInput(inp.cash_invested), own = roiInput(inp.ownership_pct, '1');
+    fin.appendChild(roiEditLine('Property value ($)', value));
+    fin.appendChild(roiEditLine('Mortgage balance ($)', debt));
+    fin.appendChild(roiEditLine('Mortgage interest rate (%)', rate));
+    fin.appendChild(roiEditLine('Actual interest paid ($, overrides rate calc)', override));
+    fin.appendChild(roiEditLine('Cash invested ($, blank = use equity)', cash));
+    fin.appendChild(roiEditLine('Your ownership (%)', own));
+    fin.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-top:8px;' },
+      `Equity ${money(c.equity)} • return basis: ${c.cash_basis}. Cash flow here is NOI minus interest only — principal paydown builds equity on top of it.`));
+    const saveBtn = el('button', { class: 'btn-primary', style: 'margin-top:12px;' }, 'Save ' + b.name);
+    saveBtn.addEventListener('click', async () => {
+      const payload = {
+        other_income: Number(otherIncome.value) || 0,
+        property_value: Number(value.value) || 0,
+        debt_balance: Number(debt.value) || 0,
+        mortgage_rate_pct: Number(rate.value) || 0,
+        mortgage_interest_override: Number(override.value) || 0,
+        cash_invested: Number(cash.value) || 0,
+        ownership_pct: Number(own.value) || 0,
+      };
+      for (const k of Object.keys(itemInputs)) payload[k] = Number(itemInputs[k].value) || 0;
+      try {
+        await API.roi.save({ year: data.year, buildings: { [b.key]: payload } });
+        toast(b.name + ' saved', 'success'); setView('roi');
+      } catch (e) {}
+    });
+    fin.appendChild(saveBtn);
+    grid.appendChild(fin);
+
+    card.appendChild(grid);
+    return card;
+  }
+  function roiMini(label, value, mod) {
+    return el('div', { class: 'roi-mini ' + (mod || '') }, el('div', { class: 'label' }, label), el('div', { class: 'value' }, value));
+  }
+  function roiInput(val, step) {
+    const i = el('input', { type: 'number', step: step || '0.01', value: val == null || val === 0 ? '' : String(val), placeholder: '0' });
+    i.style.width = '110px'; i.style.textAlign = 'right';
+    return i;
+  }
+  function roiEditLine(label, inputEl) {
+    return el('div', { class: 'stat-line roi-edit' }, el('span', null, label), inputEl);
+  }
+
   // ---------- INSIGHTS ----------
   VIEWS.insights = async (root) => {
     const data = await API.insights();
@@ -2835,6 +2943,33 @@ Matt`;
         }
       }
       root.appendChild(card);
+    }
+
+    // Building-level P&L insights (annual ROI / cash-on-cash)
+    if (data.buildings && data.buildings.length) {
+      root.appendChild(el('div', { class: 'between', style: 'margin-top:24px;' },
+        el('h1', { style: 'font-size:20px;' }, `Building P&L — ${data.roi_year}`),
+        el('button', { class: 'btn-ghost small', onclick: () => setView('roi') }, 'Open Annual ROI tab →')));
+      for (const b of data.buildings) {
+        const card = el('div', { class: 'card' });
+        const c = b.computed;
+        card.appendChild(el('div', { class: 'between' },
+          el('h2', null, `${b.name} (${b.sub})`),
+          el('div', { class: 'muted', style: 'font-size:12px;' },
+            `income ${fmtMoney(c.total_income)} • NOI ${fmtMoney(c.noi)} • cash flow ${fmtMoney(c.cash_flow)}${c.cash_on_cash != null ? ' • CoC ' + (c.cash_on_cash * 100).toFixed(1) + '%' : ''}`)));
+        if (!b.insights.length) card.appendChild(el('div', { class: 'empty' }, 'P&L looks healthy.'));
+        else {
+          const order = { act: 0, watch: 1, good: 2 };
+          b.insights.sort((x, y) => (order[x.severity] || 1) - (order[y.severity] || 1));
+          for (const t of b.insights) {
+            const meta = sevMeta[t.severity] || sevMeta.watch;
+            card.appendChild(el('div', { class: 'insight ' + meta.cls },
+              el('div', { class: 'insight-head' }, el('span', { class: 'insight-badge' }, meta.label), el('strong', null, t.title)),
+              el('div', { class: 'insight-detail' }, t.detail)));
+          }
+        }
+        root.appendChild(card);
+      }
     }
   };
 
