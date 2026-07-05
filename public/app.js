@@ -2816,8 +2816,9 @@ Matt`;
       'One P&L per building (Retreat + Hideaway share 4488 East Road). STR revenue and tracked expenses flow in automatically from bookings; enter the annual costs below and Save to update the return numbers.'));
 
     root.appendChild(el('div', { class: 'kpi-grid' },
-      kpi('Portfolio cash flow', fmtMoney(data.totals.cash_flow), 'all buildings, full ownership', data.totals.cash_flow >= 0 ? 'success' : 'danger'),
-      kpi('Your share', fmtMoney(data.totals.your_cash_flow), 'after ownership splits', data.totals.your_cash_flow >= 0 ? 'success' : 'danger'),
+      kpi('Cash flow (booked)', fmtMoney(data.totals.cash_flow), 'all buildings, income on the books', data.totals.cash_flow >= 0 ? 'success' : 'danger'),
+      kpi('Trending cash flow', fmtMoney(data.totals.trending_cash_flow), 'if season gaps fill + off-season forecast', data.totals.trending_cash_flow >= 0 ? 'success' : 'danger'),
+      kpi('Your share (booked / trending)', fmtMoney(data.totals.your_cash_flow) + ' / ' + fmtMoney(data.totals.your_trending_cash_flow), 'after ownership splits', data.totals.your_trending_cash_flow >= 0 ? 'success' : 'danger'),
       kpi('Portfolio NOI', fmtMoney(data.totals.noi), 'before mortgage interest'),
       kpi('Total income', fmtMoney(data.totals.total_income), 'STR net + other income'),
     ));
@@ -2827,37 +2828,90 @@ Matt`;
 
   function roiBuildingCard(b, data) {
     const c = b.computed, inp = b.inputs || {};
+    const t = c.trending || {};
     const card = el('div', { class: 'card' });
     card.appendChild(el('div', { class: 'between' },
-      el('div', null, el('h2', { style: 'margin-bottom:2px;' }, b.name), el('div', { class: 'muted', style: 'font-size:12px;' }, b.sub + (c.ownership_pct !== 100 ? ` • you own ${c.ownership_pct}%` : ''))),
+      el('div', null, el('h2', { style: 'margin-bottom:2px;' }, b.name), el('div', { class: 'muted', style: 'font-size:12px;' }, b.sub + (c.ownership_pct !== 100 ? ` • you own ${c.ownership_pct}%` : '') + (c.ownership_period && c.ownership_period.fraction < 1 ? ` • owned ${fmtDate(c.ownership_period.from)} → ${fmtDate(c.ownership_period.to)} (${Math.round(c.ownership_period.fraction * 100)}% of year — costs prorated)` : ''))),
       el('div', { class: 'kpi-mini-row' },
-        roiMini('Cash flow', fmtMoney(c.cash_flow), c.cash_flow >= 0 ? 'success' : 'danger'),
-        roiMini('Cash-on-cash', c.cash_on_cash == null ? '—' : (c.cash_on_cash * 100).toFixed(1) + '%', c.cash_on_cash == null ? null : c.cash_on_cash >= 0.08 ? 'success' : 'warn'),
+        roiMini('Cash flow (booked)', fmtMoney(c.cash_flow), c.cash_flow >= 0 ? 'success' : 'danger'),
+        roiMini('Trending', fmtMoney(t.cash_flow), t.cash_flow >= 0 ? 'success' : 'danger'),
+        roiMini('Cash-on-cash (trend)', t.cash_on_cash == null ? '—' : (t.cash_on_cash * 100).toFixed(1) + '%', t.cash_on_cash == null ? null : t.cash_on_cash >= 0.08 ? 'success' : 'warn'),
         roiMini('Cap rate', c.cap_rate == null ? '—' : (c.cap_rate * 100).toFixed(1) + '%', null),
-        c.ownership_pct !== 100 ? roiMini('Your share', fmtMoney(c.your_cash_flow), c.your_cash_flow >= 0 ? 'success' : 'danger') : null)));
+        c.ownership_pct !== 100 ? roiMini('Your share (trend)', fmtMoney(c.your_trending_cash_flow), c.your_trending_cash_flow >= 0 ? 'success' : 'danger') : null)));
     if (inp.notes) card.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin:4px 0 10px;font-style:italic;' }, '📝 ' + inp.notes));
 
     const grid = el('div', { class: 'roi-grid' });
+    const money = v => fmtMoney(v);
+    const roLine = (label, val, cls) => el('div', { class: 'stat-line ' + (cls || '') }, el('span', null, label), el('strong', null, money(val)));
 
     // Left: P&L (computed income + editable expense lines)
     const pnl = el('div', { class: 'roi-pnl' });
-    const money = v => fmtMoney(v);
-    const roLine = (label, val, cls) => el('div', { class: 'stat-line ' + (cls || '') }, el('span', null, label), el('strong', null, money(val)));
-    pnl.appendChild(el('h3', null, 'Income'));
-    pnl.appendChild(roLine(`STR revenue (net of ${money(c.platform_fees)} fees)`, c.str_net));
+    pnl.appendChild(el('h3', null, `Income — STR net of ${money(c.platform_fees)} platform fees`));
+    // Seasonal segments
+    pnl.appendChild(roLine(c.segments.pre.label, c.segments.pre.revenue));
+    pnl.appendChild(roLine(c.segments.season.label, c.segments.season.revenue));
+    pnl.appendChild(roLine(c.segments.post.label, c.segments.post.revenue));
+    // Per-property split (4488 = Retreat + Hideaway)
+    if (c.by_property.length > 1) {
+      pnl.appendChild(el('div', { class: 'muted', style: 'font-size:12px;padding:2px 0 4px;' },
+        'By property: ' + c.by_property.map(p => `${p.nickname} ${money(p.total)}`).join(' • ')));
+    }
+    // Expandable monthly breakdown
+    const monthlyWrap = el('div', { class: 'roi-monthly hidden' });
+    const mNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const mtbl = el('table', { class: 'roi-monthly-table' });
+    mtbl.appendChild(el('thead', null, el('tr', null,
+      el('th', null, 'Month'),
+      ...c.by_property.map(p => el('th', { class: 'num' }, p.nickname)),
+      c.by_property.length > 1 ? el('th', { class: 'num' }, 'Total') : null)));
+    const mtb = el('tbody');
+    mNames.forEach((mn, i) => {
+      if (!c.monthly_total[i] && !c.by_property.some(p => p.monthly[i])) return; // skip $0 months
+      mtb.appendChild(el('tr', null,
+        el('td', null, mn),
+        ...c.by_property.map(p => el('td', { class: 'num' }, money(p.monthly[i]))),
+        c.by_property.length > 1 ? el('td', { class: 'num' }, el('strong', null, money(c.monthly_total[i]))) : null));
+    });
+    mtb.appendChild(el('tr', null,
+      el('td', null, el('strong', null, 'Year')),
+      ...c.by_property.map(p => el('td', { class: 'num' }, el('strong', null, money(p.total)))),
+      c.by_property.length > 1 ? el('td', { class: 'num' }, el('strong', null, money(c.str_net))) : null));
+    mtbl.appendChild(mtb);
+    monthlyWrap.appendChild(mtbl);
+    const expandBtn = el('button', { class: 'btn-ghost small', type: 'button', style: 'margin:4px 0;' }, '▸ Monthly breakdown');
+    expandBtn.addEventListener('click', () => {
+      const open = monthlyWrap.classList.toggle('hidden');
+      expandBtn.textContent = (open ? '▸' : '▾') + ' Monthly breakdown';
+    });
+    pnl.appendChild(expandBtn);
+    pnl.appendChild(monthlyWrap);
+
     const otherIncome = roiInput(inp.other_income);
     pnl.appendChild(roiEditLine('Other income' + (inp.other_income_note ? ` — ${inp.other_income_note}` : ''), otherIncome));
-    pnl.appendChild(roLine('Total income', c.total_income, 'roi-total'));
-    pnl.appendChild(el('h3', { style: 'margin-top:12px;' }, 'Operating expenses'));
+    pnl.appendChild(roLine('Total income (booked)', c.total_income, 'roi-total'));
+
+    // Forecast lines → trending
+    pnl.appendChild(el('h3', { style: 'margin-top:12px;' }, 'Forecast (feeds the trending number)'));
+    const fcPre = roiInput(inp.forecast_preseason_income);
+    const fcPost = roiInput(inp.forecast_offseason_income);
+    pnl.appendChild(roiEditLine('Forecast income before season ($/yr)', fcPre));
+    pnl.appendChild(roiEditLine('Forecast income after season, Oct–Dec ($/yr)', fcPost));
+    pnl.appendChild(roLine('Remaining season potential (3+ night gaps)', c.potential_remaining_season));
+    pnl.appendChild(roLine('Trending income (gaps fill + forecasts land)', t.income, 'roi-total'));
+
+    pnl.appendChild(el('h3', { style: 'margin-top:12px;' }, 'Operating expenses' + (c.ownership_period && c.ownership_period.fraction < 1 ? ` (annual inputs × ${Math.round(c.ownership_period.fraction * 100)}% owned)` : '')));
     const itemInputs = {};
     for (const it of data.expense_items) {
       itemInputs[it.key] = roiInput(inp[it.key]);
-      pnl.appendChild(roiEditLine(it.label, itemInputs[it.key]));
+      const shown = c.ownership_period && c.ownership_period.fraction < 1 && Number(inp[it.key])
+        ? `${it.label} (→ ${money((Number(inp[it.key]) || 0) * c.ownership_period.fraction)})` : it.label;
+      pnl.appendChild(roiEditLine(shown, itemInputs[it.key]));
     }
     pnl.appendChild(roLine('STR costs tracked in app (cleaning, supplies…)', c.tracked_costs));
-    pnl.appendChild(roLine('NOI (income − operating costs)', c.noi, 'roi-total'));
+    pnl.appendChild(roLine('NOI (booked income − operating costs)', c.noi, 'roi-total'));
     pnl.appendChild(roLine(`Mortgage interest (${c.interest_source})`, -c.mortgage_interest));
-    pnl.appendChild(roLine('Annual cash flow', c.cash_flow, 'roi-grand ' + (c.cash_flow >= 0 ? 'pos' : 'neg')));
+    pnl.appendChild(roLine('Cash flow (booked)', c.cash_flow, 'roi-grand ' + (c.cash_flow >= 0 ? 'pos' : 'neg')));
+    pnl.appendChild(roLine('Cash flow (trending)', t.cash_flow, 'roi-grand ' + (t.cash_flow >= 0 ? 'pos' : 'neg')));
     grid.appendChild(pnl);
 
     // Right: financing & return inputs
@@ -2872,18 +2926,28 @@ Matt`;
     fin.appendChild(roiEditLine('Actual interest paid ($, overrides rate calc)', override));
     fin.appendChild(roiEditLine('Cash invested ($, blank = use equity)', cash));
     fin.appendChild(roiEditLine('Your ownership (%)', own));
+    fin.appendChild(el('h3', { style: 'margin-top:12px;' }, 'Ownership period (prorates annual costs)'));
+    const ownedFrom = el('input', { type: 'date', value: inp.owned_from || '' });
+    const ownedTo = el('input', { type: 'date', value: inp.owned_to || '' });
+    ownedFrom.style.width = '150px'; ownedTo.style.width = '150px';
+    fin.appendChild(roiEditLine('Owned from (blank = Jan 1)', ownedFrom));
+    fin.appendChild(roiEditLine('Owned until (blank = Dec 31)', ownedTo));
     fin.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-top:8px;' },
-      `Equity ${money(c.equity)} • return basis: ${c.cash_basis}. Cash flow here is NOI minus interest only — principal paydown builds equity on top of it.`));
+      `Equity ${money(c.equity)} • return basis: ${c.cash_basis}. Cash flow is NOI minus interest only — principal paydown builds equity on top. Trending assumes the remaining 3+ night season blocks fill and off-season forecasts land (uses whichever is higher: booked or forecast).`));
     const saveBtn = el('button', { class: 'btn-primary', style: 'margin-top:12px;' }, 'Save ' + b.name);
     saveBtn.addEventListener('click', async () => {
       const payload = {
         other_income: Number(otherIncome.value) || 0,
+        forecast_preseason_income: Number(fcPre.value) || 0,
+        forecast_offseason_income: Number(fcPost.value) || 0,
         property_value: Number(value.value) || 0,
         debt_balance: Number(debt.value) || 0,
         mortgage_rate_pct: Number(rate.value) || 0,
         mortgage_interest_override: Number(override.value) || 0,
         cash_invested: Number(cash.value) || 0,
         ownership_pct: Number(own.value) || 0,
+        owned_from: ownedFrom.value || null,
+        owned_to: ownedTo.value || null,
       };
       for (const k of Object.keys(itemInputs)) payload[k] = Number(itemInputs[k].value) || 0;
       try {
@@ -2956,7 +3020,7 @@ Matt`;
         card.appendChild(el('div', { class: 'between' },
           el('h2', null, `${b.name} (${b.sub})`),
           el('div', { class: 'muted', style: 'font-size:12px;' },
-            `income ${fmtMoney(c.total_income)} • NOI ${fmtMoney(c.noi)} • cash flow ${fmtMoney(c.cash_flow)}${c.cash_on_cash != null ? ' • CoC ' + (c.cash_on_cash * 100).toFixed(1) + '%' : ''}`)));
+            `income ${fmtMoney(c.total_income)} • NOI ${fmtMoney(c.noi)} • cash flow ${fmtMoney(c.cash_flow)}${c.trending ? ' • trending ' + fmtMoney(c.trending.cash_flow) : ''}${c.cash_on_cash != null ? ' • CoC ' + (c.cash_on_cash * 100).toFixed(1) + '%' : ''}`)));
         if (!b.insights.length) card.appendChild(el('div', { class: 'empty' }, 'P&L looks healthy.'));
         else {
           const order = { act: 0, watch: 1, good: 2 };

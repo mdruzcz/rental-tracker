@@ -635,3 +635,8 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .roi-mini.warn .value { color: var(--warning-ink); }
 .roi-mini.danger .value { color: var(--danger-ink); }
 @media (max-width: 900px) { .roi-grid { grid-template-columns: 1fr; } }
+
+/* ROI monthly breakdown */
+.roi-monthly { margin: 4px 0 8px; }
+.roi-monthly-table { font-size: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+.roi-monthly-table th, .roi-monthly-table td { padding: 5px 10px; }

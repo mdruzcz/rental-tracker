@@ -2352,7 +2352,8 @@ const ROI_SEEDS = {
       other_income: 0, other_income_note: '',
       property_value: 0, debt_balance: 0, mortgage_rate_pct: 0,
       mortgage_interest_override: 0, cash_invested: 0, ownership_pct: 100,
-      notes: 'ALL EXPENSE LINES ARE ESTIMATES (new property, listed July 2026) — replace with real bills. Fill in property value, mortgage balance and rate to complete the return calc.',
+      owned_from: '2026-05-11',
+      notes: 'Closed May 11 2026 — annual costs are prorated to the ownership period. ALL EXPENSE LINES ARE ESTIMATES (new property, listed July 2026) — replace with real bills. Fill in property value, mortgage balance and rate to complete the return calc.',
     },
   },
 };
@@ -2368,11 +2369,23 @@ function getRoiInputs(year) {
 function computeRoi(year) {
   const inputs = getRoiInputs(year);
   const yStart = `${year}-01-01`, yEnd = `${year}-12-31`;
+  const today = new Date().toISOString().slice(0, 10);
   const bookings = tableAll('bookings').map(joinBooking)
     .filter(b => b.status !== 'cancelled' && b.check_in >= yStart && b.check_in <= yEnd);
   const expenses = tableAll('expenses').filter(e => (e.date || '') >= yStart && (e.date || '') <= yEnd);
   const props = tableAll('properties');
   const num = v => Number(v) || 0;
+  // Airbnb season boundaries (settings-driven; default Jun 1 – Oct 1).
+  const seasonStart = `${year}-${getSetting('season_start_md', '06-01')}`;
+  const seasonEnd = `${year}-${getSetting('season_end_md', '10-01')}`;
+  const daysInYear = Math.round((Date.parse(`${year + 1}-01-01`) - Date.parse(`${year}-01-01`)) / 86400000);
+
+  // Season ADR fallback for the remaining-potential projection.
+  const adrByProp = {};
+  for (const p of props) {
+    const s = revenueInWindow(bookings, p.id, seasonStart, seasonEnd);
+    adrByProp[p.id] = s.nights ? +(s.revenue / s.nights).toFixed(2) : 0;
+  }
 
   const buildings = ROI_BUILDINGS.map(b => {
     const inp = inputs[b.key] || {};
@@ -2383,8 +2396,41 @@ function computeRoi(year) {
     const str_net = +(str_gross - platform_fees).toFixed(2);
     const tracked_costs = +expenses.filter(e => propIds.includes(e.property_id)).reduce((a, e) => a + (e.amount || 0), 0).toFixed(2);
 
-    const line_items = ROI_EXPENSE_ITEMS.map(([k, label]) => ({ key: k, label, amount: num(inp[k]) }));
-    const input_opex = +line_items.reduce((a, li) => a + li.amount, 0).toFixed(2);
+    // Ownership period: annual cost inputs and rate-based interest are prorated to the
+    // days actually owned (479 George closed May 11 2026 → ~64% of the year).
+    const ownedFrom = (inp.owned_from && String(inp.owned_from) >= yStart) ? String(inp.owned_from) : yStart;
+    const ownedTo = (inp.owned_to && String(inp.owned_to) <= yEnd) ? String(inp.owned_to) : yEnd;
+    const ownedDays = Math.max(0, Math.round((Date.parse(ownedTo) - Date.parse(ownedFrom)) / 86400000) + 1);
+    const ownedFraction = Math.min(1, ownedDays / daysInYear);
+
+    // Seasonal income segments (net of platform fees, by check-in date).
+    const netOf = x => (x.amount || 0) + (x.upsell_total || 0) - (x.platform_fee || 0);
+    const seg = (from, to) => +bs.filter(x => x.check_in >= from && x.check_in < to).reduce((a, x) => a + netOf(x), 0).toFixed(2);
+    const segments = {
+      pre: { label: `Before season (Jan 1 – ${seasonStart.slice(5)})`, revenue: seg(yStart, seasonStart) },
+      season: { label: `Airbnb season (${seasonStart.slice(5)} – ${seasonEnd.slice(5)})`, revenue: seg(seasonStart, seasonEnd) },
+      post: { label: `After season (${seasonEnd.slice(5)} – Dec 31)`, revenue: seg(seasonEnd, addDays(yEnd, 1)) },
+    };
+
+    // Monthly per-property breakdown (net revenue by check-in month).
+    const by_property = propIds.map(pid => {
+      const p = props.find(x => x.id === pid);
+      const monthly = Array.from({ length: 12 }, () => 0);
+      bs.filter(x => x.property_id === pid).forEach(x => { monthly[Number(x.check_in.slice(5, 7)) - 1] += netOf(x); });
+      const rounded = monthly.map(v => +v.toFixed(2));
+      return { id: pid, nickname: p ? p.nickname : String(pid), monthly: rounded, total: +rounded.reduce((a, v) => a + v, 0).toFixed(2) };
+    });
+    const monthly_total = Array.from({ length: 12 }, (_, m) => +by_property.reduce((a, p) => a + p.monthly[m], 0).toFixed(2));
+
+    // Remaining season potential: vacant 3+ night runs from today through season end.
+    let potential_remaining_season = 0;
+    if (String(year) === today.slice(0, 4) && today < seasonEnd && propIds.length) {
+      const projStart = today > seasonStart ? today : seasonStart;
+      potential_remaining_season = +computePotentialRevenue(propIds, projStart, seasonEnd, adrByProp, 3).total.toFixed(2);
+    }
+
+    const line_items = ROI_EXPENSE_ITEMS.map(([k, label]) => ({ key: k, label, amount: num(inp[k]), prorated: +(num(inp[k]) * ownedFraction).toFixed(2) }));
+    const input_opex = +line_items.reduce((a, li) => a + li.prorated, 0).toFixed(2);
     const other_income = num(inp.other_income);
     const total_income = +(str_net + other_income).toFixed(2);
     const total_opex = +(input_opex + tracked_costs).toFixed(2);
@@ -2393,8 +2439,16 @@ function computeRoi(year) {
     const debt = num(inp.debt_balance);
     const rate = num(inp.mortgage_rate_pct);
     const override = num(inp.mortgage_interest_override);
-    const mortgage_interest = +(override > 0 ? override : debt * rate / 100).toFixed(2);
+    const mortgage_interest = +(override > 0 ? override : debt * rate / 100 * ownedFraction).toFixed(2);
     const cash_flow = +(noi - mortgage_interest).toFixed(2);
+
+    // Trending / forecast: season books out its 3+ night gaps, and the off-season windows
+    // hit your forecast (whichever is higher — already-booked or forecast).
+    const fcPre = Math.max(num(inp.forecast_preseason_income), segments.pre.revenue);
+    const fcPost = Math.max(num(inp.forecast_offseason_income), segments.post.revenue);
+    const trending_income = +(fcPre + segments.season.revenue + potential_remaining_season + fcPost + other_income).toFixed(2);
+    const trending_noi = +(trending_income - total_opex).toFixed(2);
+    const trending_cash_flow = +(trending_noi - mortgage_interest).toFixed(2);
 
     const value = num(inp.property_value);
     const equity = +(value - debt).toFixed(2);
@@ -2405,14 +2459,23 @@ function computeRoi(year) {
       inputs: inp,
       computed: {
         str_gross, platform_fees, str_net, tracked_costs, other_income,
+        segments, by_property, monthly_total,
+        potential_remaining_season,
         total_income, input_opex, total_opex, noi,
-        mortgage_interest, interest_source: override > 0 ? 'actual (override)' : 'balance × rate',
+        mortgage_interest, interest_source: override > 0 ? 'actual (override)' : 'balance × rate' + (ownedFraction < 1 ? ' × owned period' : ''),
         cash_flow, equity,
+        ownership_period: { from: ownedFrom, to: ownedTo, days: ownedDays, fraction: +ownedFraction.toFixed(3) },
+        trending: {
+          income: trending_income, noi: trending_noi, cash_flow: trending_cash_flow,
+          cash_on_cash: cashBase > 0 ? +(trending_cash_flow / cashBase).toFixed(4) : null,
+          preseason_used: +fcPre.toFixed(2), postseason_used: +fcPost.toFixed(2),
+        },
         cap_rate: value > 0 ? +(noi / value).toFixed(4) : null,
         cash_on_cash: cashBase > 0 ? +(cash_flow / cashBase).toFixed(4) : null,
         cash_basis: num(inp.cash_invested) > 0 ? 'cash invested' : 'equity (value − debt)',
         ownership_pct: ownership * 100,
         your_cash_flow: +(cash_flow * ownership).toFixed(2),
+        your_trending_cash_flow: +(trending_cash_flow * ownership).toFixed(2),
       },
     };
   });
@@ -2421,8 +2484,10 @@ function computeRoi(year) {
     your_cash_flow: +buildings.reduce((a, b) => a + b.computed.your_cash_flow, 0).toFixed(2),
     noi: +buildings.reduce((a, b) => a + b.computed.noi, 0).toFixed(2),
     total_income: +buildings.reduce((a, b) => a + b.computed.total_income, 0).toFixed(2),
+    trending_cash_flow: +buildings.reduce((a, b) => a + b.computed.trending.cash_flow, 0).toFixed(2),
+    your_trending_cash_flow: +buildings.reduce((a, b) => a + b.computed.your_trending_cash_flow, 0).toFixed(2),
   };
-  return { year, expense_items: ROI_EXPENSE_ITEMS.map(([key, label]) => ({ key, label })), buildings, totals };
+  return { year, season: { start: seasonStart, end: seasonEnd }, expense_items: ROI_EXPENSE_ITEMS.map(([key, label]) => ({ key, label })), buildings, totals };
 }
 app.get('/api/roi', (req, res) => {
   const year = Number(req.query.year) || new Date().getFullYear();
@@ -2511,8 +2576,10 @@ function computeInsights() {
     const fmt$ = n => '$' + Math.round(n).toLocaleString('en-CA');
     if (!b.property_ids.length) return null;
 
-    if (c.total_income > 0 && c.cash_flow < 0) {
-      tips.push({ severity: 'act', title: `Cash-flow negative: ${fmt$(c.cash_flow)} this year so far`, detail: `Income ${fmt$(c.total_income)} minus operating costs ${fmt$(c.total_opex)} and mortgage interest ${fmt$(c.mortgage_interest)} leaves a shortfall. Check the ROI tab: either revenue needs to catch up over the season or a cost line is out of proportion.` });
+    if (c.total_income > 0 && c.cash_flow < 0 && c.trending && c.trending.cash_flow >= 0) {
+      tips.push({ severity: 'watch', title: `Behind on cash (${fmt$(c.cash_flow)} booked) but trending to ${fmt$(c.trending.cash_flow)}`, detail: `Booked income hasn't caught the full-year costs yet, but if the remaining 3+ night season gaps fill and the off-season forecast lands, this building finishes at ${fmt$(c.trending.cash_flow)}. The gap between those two numbers is what's still up for grabs — every unfilled block eats into it.` });
+    } else if (c.total_income > 0 && c.cash_flow < 0) {
+      tips.push({ severity: 'act', title: `Cash-flow negative: ${fmt$(c.cash_flow)} this year so far`, detail: `Income ${fmt$(c.total_income)} minus operating costs ${fmt$(c.total_opex)} and mortgage interest ${fmt$(c.mortgage_interest)} leaves a shortfall — and even the trending view (season gaps filled + off-season forecast) stays negative at ${fmt$(c.trending ? c.trending.cash_flow : 0)}. Something structural needs to change: rates, off-season income, or a cost line.` });
     } else if (c.cash_flow > 0 && c.cash_on_cash != null) {
       const pct = Math.round(c.cash_on_cash * 1000) / 10;
       const sev = c.cash_on_cash >= 0.08 ? 'good' : 'watch';
