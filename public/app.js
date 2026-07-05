@@ -201,7 +201,10 @@
       update: (b) => api('PUT', '/api/settings', b),
     },
     bookingTypeUpdate: (id, b) => api('PUT', `/api/booking-types/${id}`, b),
-    financials: (year) => api('GET', '/api/financials' + (year ? '?year=' + year : '')),
+    financials: (year, propertyId) => api('GET', '/api/financials?' + new URLSearchParams({ ...(year ? { year } : {}), ...(propertyId ? { property_id: propertyId } : {}) })),
+    propertyStats: () => api('GET', '/api/property-stats'),
+    insights: () => api('GET', '/api/insights'),
+    listingMeta: (id, b) => api('PUT', `/api/properties/${id}/listing-meta`, b),
     orphans: () => api('GET', '/api/orphans'),
     messageTemplates: { list: () => api('GET', '/api/message-templates'), update: (id, b) => api('PUT', `/api/message-templates/${id}`, b) },
     messagesScheduled: () => api('GET', '/api/messages/scheduled'),
@@ -608,7 +611,7 @@
 
   // ---------- PROPERTIES ----------
   VIEWS.properties = async (root) => {
-    const [props, cleaners] = await Promise.all([API.properties.list(), API.cleaners.list()]);
+    const [props, cleaners, statsData] = await Promise.all([API.properties.list(), API.cleaners.list(), API.propertyStats().catch(() => null)]);
     root.appendChild(el('div', { class: 'between' },
       el('h1', null, 'Properties'),
       el('button', { class: 'btn-primary', onclick: () => propertyForm(null, cleaners) }, '+ New property')
@@ -660,6 +663,7 @@
             catch (e) {}
           }}, 'Sync'),
           el('button', { class: 'btn-ghost', onclick: () => propertyForm(p, cleaners) }, 'Edit'),
+          el('button', { class: 'btn-ghost', title: 'Listing headline & description (used by Insights)', onclick: () => listingForm(p, statsData) }, 'Listing'),
           el('button', { class: 'btn-danger', onclick: async () => {
             if (!confirm(`Delete "${p.nickname}" and all its bookings/maintenance items?`)) return;
             await API.properties.remove(p.id);
@@ -671,7 +675,83 @@
     tbl.appendChild(tb);
     card.appendChild(tbl);
     root.appendChild(card);
+
+    // ---- Per-property performance (occupancy / revenue / ADR / YOY) ----
+    if (statsData && statsData.properties && statsData.properties.length) {
+      root.appendChild(el('h2', { style: 'margin-top:18px;' }, 'Performance'));
+      for (const s of statsData.properties) root.appendChild(propertyStatsCard(s));
+    }
   };
+
+  function occBar(occupancy) {
+    const pctVal = Math.min(100, Math.round((occupancy || 0) * 100));
+    const color = pctVal >= 70 ? 'var(--success)' : pctVal >= 40 ? 'var(--warning)' : 'var(--danger)';
+    return el('div', { class: 'occ-bar' }, el('div', { class: 'occ-fill', style: `width:${pctVal}%;background:${color};` }));
+  }
+  function yoyBadge(cur, last, fmt) {
+    if (last == null || last === 0) return el('span', { class: 'muted', style: 'font-size:11px;' }, 'no LY data');
+    const delta = (cur - last) / last;
+    const up = delta >= 0;
+    return el('span', { class: 'badge ' + (up ? 'approved' : 'unlicensed'), title: `Last year: ${fmt(last)}` },
+      (up ? '▲ ' : '▼ ') + Math.abs(Math.round(delta * 100)) + '% vs LY');
+  }
+  function propertyStatsCard(s) {
+    const card = el('div', { class: 'card prop-stats' });
+    const ja = s.july_august, season = s.season;
+    card.appendChild(el('div', { class: 'between' },
+      el('h2', null, s.nickname),
+      el('div', { class: 'btn-row' },
+        yoyBadge(season.revenue, season.last_year.revenue, fmtMoney),
+        el('span', { class: 'muted', style: 'font-size:12px;' }, `season ${fmtDate(season.start)} – ${fmtDate(season.end)}`))));
+
+    const winRow = el('div', { class: 'stat-windows' });
+    for (const w of [14, 30, 60]) {
+      const win = s.windows['next_' + w];
+      winRow.appendChild(el('div', { class: 'stat-window' },
+        el('div', { class: 'label' }, `Next ${w} days`),
+        el('div', { class: 'value' }, pct(win.occupancy)),
+        occBar(win.occupancy),
+        el('div', { class: 'sub' }, `${win.occupied_nights}/${w} nights booked`),
+        el('div', { class: 'stat-line' }, el('span', null, 'Revenue'), el('strong', null, fmtMoney(win.revenue))),
+        el('div', { class: 'stat-line' }, el('span', null, 'If gaps filled (3+ nt)'), el('strong', { style: 'color:var(--success);' }, '+' + fmtMoney(win.potential_revenue))),
+        el('div', { class: 'stat-line' }, el('span', null, 'Booked avg $/night'), el('strong', null, win.adr != null ? fmtMoney(win.adr) : '—')),
+        win.vacant_weekend_nights ? el('div', { class: 'stat-line warn-line' }, el('span', null, 'Open Fri/Sat nights'), el('strong', null, String(win.vacant_weekend_nights))) : null,
+      ));
+    }
+    card.appendChild(winRow);
+
+    card.appendChild(el('div', { class: 'kpi-grid', style: 'margin-top:10px;' },
+      kpi('July/Aug occupancy', pct(ja.occupancy), `${ja.occupied_nights}/${ja.days} nights • LY ${pct(ja.last_year.occupancy)}`, ja.occupancy >= ja.last_year.occupancy ? 'success' : 'warn'),
+      kpi('July/Aug revenue', fmtMoney(ja.revenue), `LY ${fmtMoney(ja.last_year.revenue)}`, ja.revenue >= ja.last_year.revenue ? 'success' : 'warn'),
+      kpi('Achieved $/night', season.adr_achieved != null ? fmtMoney(season.adr_achieved) : '—', `LY ${season.last_year.adr != null ? fmtMoney(season.last_year.adr) : '—'}`),
+      kpi('Season revenue', fmtMoney(season.revenue), season.yoy_revenue_pct == null ? `LY ${fmtMoney(season.last_year.revenue)}` : `${season.yoy_revenue_pct >= 0 ? '+' : ''}${Math.round(season.yoy_revenue_pct * 100)}% vs LY ${fmtMoney(season.last_year.revenue)}`, season.yoy_revenue_pct >= 0 ? 'success' : 'danger'),
+      kpi('Forward vs achieved $', s.windows.next_30.adr != null && season.adr_achieved ? fmtMoney(s.windows.next_30.adr) : '—', season.adr_achieved ? `next 30d bookings vs ${fmtMoney(season.adr_achieved)} achieved` : 'no season bookings yet'),
+      kpi('PriceLabs rec (30d avg)', s.pricelabs_avg_next_30 != null ? fmtMoney(s.pricelabs_avg_next_30) : '—', s.pricelabs_avg_next_30 != null ? 'market-based recommendation' : 'refresh Pricing tab to fetch'),
+    ));
+    return card;
+  }
+
+  function listingForm(p, statsData) {
+    const meta = (statsData && statsData.properties.find(x => x.id === p.id) || {}).listing || {};
+    const form = el('form', { class: 'form-grid' });
+    form.appendChild(formField('Listing headline (as shown on Airbnb/VRBO)', input('headline', { value: meta.headline, placeholder: 'e.g. "Lakefront Retreat w/ Hot Tub — 5 min to Port Stanley Beach"' }), { full: true }));
+    form.appendChild(formField('Listing description', textarea('description', meta.description, { rows: 8, placeholder: 'Paste your live listing description here…' }), { full: true }));
+    form.appendChild(formField('Key amenities (comma-separated)', textarea('amenities', meta.amenities, { rows: 2, placeholder: 'hot tub, fire pit, kayaks, fast wifi, pet friendly' }), { full: true }));
+    form.appendChild(formField('Who is this place for?', input('target_guest', { value: meta.target_guest, placeholder: 'e.g. families of 6-8, couples getaway, remote workers' }), { full: true }));
+    form.appendChild(el('div', { class: 'muted', style: 'grid-column:1/-1;font-size:12px;' },
+      'This copy feeds the Insights tab — keep it in sync with your live listings so recommendations reflect how the property is actually marketed.'));
+    form.appendChild(el('div', { class: 'btn-row', style: 'grid-column:1/-1;margin-top:8px;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, 'Save listing'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await API.listingMeta(p.id, readForm(form));
+        toast('Listing saved', 'success'); closeModal(); setView('properties');
+      } catch (e) {}
+    });
+    openModal(p.nickname + ' — listing copy', form);
+  }
 
   function propertyForm(p, cleaners) {
     const form = el('form', { class: 'form-grid' });
@@ -800,9 +880,12 @@
       onclick: () => { highlightConflicts = !highlightConflicts; localStorage.setItem('cal_hl_conflicts', highlightConflicts ? 'on' : 'off'); render(); } }, '⚠ Conflicts');
     const orphansBtn = el('button', { class: 'btn-ghost small', title: 'Highlight fillable gap nights',
       onclick: () => { highlightOrphans = !highlightOrphans; localStorage.setItem('cal_hl_orphans', highlightOrphans ? 'on' : 'off'); render(); } }, '🔆 Orphans');
+    let calCompare = localStorage.getItem('cal_compare') === 'on';
+    const compareBtn = el('button', { class: 'btn-ghost small', title: 'Show the same month last year side-by-side, with revenue totals',
+      onclick: () => { calCompare = !calCompare; localStorage.setItem('cal_compare', calCompare ? 'on' : 'off'); if (calCompare && calMode !== 'grid') { calMode = 'grid'; localStorage.setItem('cal_mode', 'grid'); } render(); } }, '🔁 vs Last Year');
     head.appendChild(el('div', { class: 'btn-row' }, prev, today, next));
     head.appendChild(monthLbl);
-    head.appendChild(el('div', { class: 'cal-head-controls', style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;' }, modeToggle, pricesBtn, conflictsBtn, orphansBtn, propFilter, blockBtn, quoteBtn));
+    head.appendChild(el('div', { class: 'cal-head-controls', style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;' }, modeToggle, pricesBtn, conflictsBtn, orphansBtn, compareBtn, propFilter, blockBtn, quoteBtn));
     wrap.appendChild(head);
     const body = el('div', { class: 'cal-body' });
     wrap.appendChild(body);
@@ -828,31 +911,72 @@
       pricesBtn.classList.toggle('active', showPrices);
       conflictsBtn.classList.toggle('active', highlightConflicts);
       orphansBtn.classList.toggle('active', highlightOrphans);
+      compareBtn.classList.toggle('active', calCompare);
       const propId = propFilter.value;
       const todayStr = isoToday();
       const filtered = events.filter(ev => !propId || String(ev.property_id) === propId);
 
       if (calMode === 'agenda') { renderAgenda(body, filtered, todayStr); return; }
 
+      const y = calCursor.getFullYear(), mo = calCursor.getMonth();
+      if (calCompare) {
+        const cur = monthRevenue(y, mo, propId), ly = monthRevenue(y - 1, mo, propId);
+        const deltaTxt = ly.revenue > 0
+          ? `${cur.revenue >= ly.revenue ? '+' : ''}${fmtMoney(cur.revenue - ly.revenue)} (${cur.revenue >= ly.revenue ? '+' : ''}${Math.round((cur.revenue - ly.revenue) / ly.revenue * 100)}%) vs last year`
+          : 'no revenue on record last year';
+        body.appendChild(el('div', { class: 'cal-compare-strip ' + (ly.revenue > 0 && cur.revenue < ly.revenue ? 'behind' : 'ahead') },
+          el('strong', null, deltaTxt),
+          el('span', { class: 'muted' }, ` • ${cur.nights} booked nights vs ${ly.nights} last year`)));
+        body.appendChild(el('div', { class: 'cal-compare' },
+          comparePane(y, mo, filtered, todayStr, cur),
+          comparePane(y - 1, mo, filtered, todayStr, ly)));
+        return;
+      }
+      body.appendChild(buildMonthGrid(y, mo, filtered, todayStr));
+    }
+    // Per-night-allocated revenue + booked nights for one property-filtered month.
+    function monthRevenue(yy, mo0, propId) {
+      const mStart = localIso(new Date(yy, mo0, 1));
+      const mEnd = localIso(new Date(yy, mo0 + 1, 1));
+      let revenue = 0, nights = 0;
+      for (const b of bookings) {
+        if (b.status === 'cancelled' || !b.check_in) continue;
+        if (propId && String(b.property_id) !== propId) continue;
+        const end = b.check_out || b.check_in;
+        const s = b.check_in > mStart ? b.check_in : mStart;
+        const e = end < mEnd ? end : mEnd;
+        if (e <= s) continue;
+        const nw = Math.round((new Date(e) - new Date(s)) / 86400000);
+        const len = Math.max(1, Math.round((new Date(end) - new Date(b.check_in)) / 86400000));
+        revenue += ((b.amount || 0) + (b.upsell_total || 0)) / len * nw;
+        nights += nw;
+      }
+      return { revenue: Math.round(revenue), nights };
+    }
+    function comparePane(yy, mo0, filtered, todayStr, rev) {
+      return el('div', { class: 'cal-compare-col' },
+        el('div', { class: 'cal-compare-title' },
+          el('strong', null, new Date(yy, mo0, 1).toLocaleDateString('en-CA', { year: 'numeric', month: 'long' })),
+          el('span', null, ` — ${fmtMoney(rev.revenue)} • ${rev.nights} nights`)),
+        buildMonthGrid(yy, mo0, filtered, todayStr));
+    }
+    function buildMonthGrid(yy, mo0, filtered, todayStr) {
       const grid = el('div', { class: 'cal-grid' });
-      body.appendChild(grid);
       ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(n => grid.appendChild(el('div', { class: 'cal-dayname' }, n)));
-      const first = new Date(calCursor.getFullYear(), calCursor.getMonth(), 1);
+      const first = new Date(yy, mo0, 1);
       const startDayIdx = first.getDay();
-      const daysInMonth = new Date(calCursor.getFullYear(), calCursor.getMonth() + 1, 0).getDate();
+      const daysInMonth = new Date(yy, mo0 + 1, 0).getDate();
       for (let i = 0; i < startDayIdx; i++) {
-        const d = new Date(calCursor.getFullYear(), calCursor.getMonth(), -startDayIdx + i + 1);
-        grid.appendChild(dayCell(d, true, filtered, todayStr));
+        grid.appendChild(dayCell(new Date(yy, mo0, -startDayIdx + i + 1), true, filtered, todayStr));
       }
       for (let day = 1; day <= daysInMonth; day++) {
-        const d = new Date(calCursor.getFullYear(), calCursor.getMonth(), day);
-        grid.appendChild(dayCell(d, false, filtered, todayStr));
+        grid.appendChild(dayCell(new Date(yy, mo0, day), false, filtered, todayStr));
       }
       const trailing = (7 - ((startDayIdx + daysInMonth) % 7)) % 7;
       for (let i = 1; i <= trailing; i++) {
-        const d = new Date(calCursor.getFullYear(), calCursor.getMonth() + 1, i);
-        grid.appendChild(dayCell(d, true, filtered, todayStr));
+        grid.appendChild(dayCell(new Date(yy, mo0 + 1, i), true, filtered, todayStr));
       }
+      return grid;
     }
     // Shared event-open behaviour (used by both grid cells and agenda rows).
     function openEvent(ev) {
@@ -2547,6 +2671,7 @@ Matt`;
   // ========================================================
   const EXPENSE_CATEGORIES = ['Cleaning', 'Supplies', 'Utilities', 'Mortgage/Interest', 'Property Tax', 'Maintenance', 'Repairs', 'Insurance', 'Licensing', 'Internet/Cable', 'Platform Fees', 'Furnishings', 'Marketing', 'Other'];
   let financialsYear = new Date().getFullYear();
+  let financialsProp = ''; // '' = all properties
 
   function simpleTable(headers, rows) {
     const tbl = el('table');
@@ -2565,14 +2690,18 @@ Matt`;
 
   // ---------- MONEY / FINANCIALS ----------
   VIEWS.financials = async (root) => {
-    const [f, props, types] = await Promise.all([API.financials(financialsYear), API.properties.list(), API.bookingTypes.list()]);
+    const [f, props, types] = await Promise.all([API.financials(financialsYear, financialsProp || null), API.properties.list(), API.bookingTypes.list()]);
     const m = f.metrics || {};
     const yearSel = select('fy', (() => { const o = []; const cy = new Date().getFullYear(); for (let y = cy + 1; y >= cy - 4; y--) o.push({ value: String(y), label: String(y) }); return o; })(), String(financialsYear));
     yearSel.style.width = 'auto';
     yearSel.addEventListener('change', () => { financialsYear = Number(yearSel.value); setView('financials'); });
+    const propSel = select('fp', [{ value: '', label: 'All properties' }].concat(props.map(p => ({ value: String(p.id), label: p.nickname }))), financialsProp);
+    propSel.style.width = 'auto';
+    propSel.addEventListener('change', () => { financialsProp = propSel.value; setView('financials'); });
     root.appendChild(el('div', { class: 'between' },
-      el('h1', null, 'Money'),
-      el('div', { style: 'display:flex;gap:8px;align-items:center;' }, el('span', { class: 'muted' }, 'Year'), yearSel,
+      el('h1', null, 'Money' + (financialsProp ? ' — ' + ((props.find(p => String(p.id) === financialsProp) || {}).nickname || '') : '')),
+      el('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;' }, el('span', { class: 'muted' }, 'Year'), yearSel,
+        el('span', { class: 'muted' }, 'Property'), propSel,
         el('button', { class: 'btn-ghost', onclick: () => exportPnl(f) }, '⬇ Export P&L'))));
 
     root.appendChild(el('div', { class: 'kpi-grid' },
@@ -2671,6 +2800,43 @@ Matt`;
     });
     openModal('Channel fees', form);
   }
+
+  // ---------- INSIGHTS ----------
+  VIEWS.insights = async (root) => {
+    const data = await API.insights();
+    root.appendChild(el('div', { class: 'between' },
+      el('h1', null, 'Insights'),
+      el('span', { class: 'muted' }, 'Generated from live bookings, last year\'s history, pricing, gaps & reviews')));
+    const sevMeta = {
+      act:   { label: 'Act now', cls: 'insight-act' },
+      watch: { label: 'Worth a look', cls: 'insight-watch' },
+      good:  { label: 'Working', cls: 'insight-good' },
+    };
+    if (!data.properties.length) { root.appendChild(el('div', { class: 'card empty' }, 'No properties yet.')); return; }
+    for (const p of data.properties) {
+      const card = el('div', { class: 'card' });
+      const s = p.stats;
+      card.appendChild(el('div', { class: 'between' },
+        el('h2', null, p.nickname),
+        el('div', { class: 'muted', style: 'font-size:12px;' },
+          `next 30d: ${pct(s.windows.next_30.occupancy)} booked • ${fmtMoney(s.windows.next_30.revenue)} on the books • July/Aug ${pct(s.july_august.occupancy)} vs LY ${pct(s.july_august.last_year.occupancy)}`)));
+      if (!p.insights.length) {
+        card.appendChild(el('div', { class: 'empty' }, 'Nothing urgent — this property looks healthy.'));
+      } else {
+        const order = { act: 0, watch: 1, good: 2 };
+        p.insights.sort((a, b) => (order[a.severity] || 1) - (order[b.severity] || 1));
+        for (const t of p.insights) {
+          const meta = sevMeta[t.severity] || sevMeta.watch;
+          card.appendChild(el('div', { class: 'insight ' + meta.cls },
+            el('div', { class: 'insight-head' },
+              el('span', { class: 'insight-badge' }, meta.label),
+              el('strong', null, t.title)),
+            el('div', { class: 'insight-detail' }, t.detail)));
+        }
+      }
+      root.appendChild(card);
+    }
+  };
 
   // ---------- EXPENSES ----------
   VIEWS.expenses = async (root) => {

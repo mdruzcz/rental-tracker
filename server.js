@@ -1185,7 +1185,9 @@ function buildCalendarEvents() {
 }
 
 // A conflict = two distinct guest entries (booking/reserved) overlapping at one property.
+// Only current/future overlaps count — historical ones (e.g. imported records) are moot.
 function computeConflicts(events) {
+  const today = new Date().toISOString().slice(0, 10);
   const guests = events.filter(e => e.kind === 'booking' || e.kind === 'reserved');
   const out = [];
   for (let i = 0; i < guests.length; i++) {
@@ -1193,6 +1195,8 @@ function computeConflicts(events) {
       const a = guests[i], b = guests[j];
       if (a.property_id !== b.property_id) continue;
       if (!rangesOverlap(a.start, a.end, b.start, b.end)) continue;
+      const overlapEnd = effEnd(a.start, a.end) < effEnd(b.start, b.end) ? effEnd(a.start, a.end) : effEnd(b.start, b.end);
+      if (overlapEnd < today) continue; // already history — nothing to resolve
       out.push({
         property_id: a.property_id, property_name: a.property_name,
         overlap_start: a.start > b.start ? a.start : b.start,
@@ -1981,11 +1985,14 @@ app.put('/api/booking-types/:id', (req, res) => {
 });
 
 // ---------- FINANCIALS / NET PROFIT ----------
-function computeFinancials(year) {
+function computeFinancials(year, propertyId) {
   const yStart = `${year}-01-01`, yEnd = `${year}-12-31`;
+  const pid = propertyId ? Number(propertyId) : null;
   const bookings = tableAll('bookings').map(joinBooking)
-    .filter(b => b.status !== 'cancelled' && b.check_in >= yStart && b.check_in <= yEnd);
-  const expenses = tableAll('expenses').filter(e => (e.date || '') >= yStart && (e.date || '') <= yEnd);
+    .filter(b => b.status !== 'cancelled' && b.check_in >= yStart && b.check_in <= yEnd)
+    .filter(b => !pid || b.property_id === pid);
+  const expenses = tableAll('expenses').filter(e => (e.date || '') >= yStart && (e.date || '') <= yEnd)
+    .filter(e => !pid || e.property_id === pid);
   const gross = bookings.reduce((a, b) => a + (b.amount || 0), 0);
   const upsell = bookings.reduce((a, b) => a + (b.upsell_total || 0), 0);
   const fees = bookings.reduce((a, b) => a + (b.platform_fee || 0), 0);
@@ -1993,7 +2000,7 @@ function computeFinancials(year) {
   const totalRevenue = gross + upsell;
   const netProfit = +(totalRevenue - fees - totalExpenses).toFixed(2);
   const margin = totalRevenue > 0 ? +(netProfit / totalRevenue).toFixed(3) : 0;
-  const byProperty = tableAll('properties').map(p => {
+  const byProperty = tableAll('properties').filter(p => !pid || p.id === pid).map(p => {
     const bs = bookings.filter(b => b.property_id === p.id);
     const rev = bs.reduce((a, b) => a + (b.amount || 0) + (b.upsell_total || 0), 0);
     const fee = bs.reduce((a, b) => a + (b.platform_fee || 0), 0);
@@ -2027,8 +2034,9 @@ function computeFinancials(year) {
     by_property: byProperty, by_channel: byChannel, expense_categories: expenseCategories, pnl_by_month: pnl,
   };
 }
-function computeMetrics(year) {
-  const all = tableAll('bookings').map(joinBooking);
+function computeMetrics(year, propertyId) {
+  const pid = propertyId ? Number(propertyId) : null;
+  const all = tableAll('bookings').map(joinBooking).filter(b => !pid || b.property_id === pid);
   const yStart = `${year}-01-01`, yEnd = `${year}-12-31`;
   const ytd = all.filter(b => b.check_in >= yStart && b.check_in <= yEnd);
   const active = ytd.filter(b => b.status !== 'cancelled');
@@ -2044,10 +2052,10 @@ function computeMetrics(year) {
   const repeatRate = guestsWithBookings ? +(repeatGuests / guestsWithBookings).toFixed(3) : 0;
   const directCount = active.filter(b => b.booking_type_is_direct).length;
   const directPct = active.length ? +(directCount / active.length).toFixed(3) : 0;
-  const reviews = tableAll('reviews');
+  const reviews = tableAll('reviews').filter(r => !pid || r.property_id === pid);
   const reviewCount = reviews.length;
   const avgRating = reviewCount ? +(reviews.reduce((a, r) => a + (Number(r.rating) || 0), 0) / reviewCount).toFixed(2) : 0;
-  const cleaningExp = tableAll('expenses').filter(e => (e.date || '').slice(0, 4) === String(year) && /clean/i.test(e.category || '')).reduce((a, e) => a + (e.amount || 0), 0);
+  const cleaningExp = tableAll('expenses').filter(e => (!pid || e.property_id === pid) && (e.date || '').slice(0, 4) === String(year) && /clean/i.test(e.category || '')).reduce((a, e) => a + (e.amount || 0), 0);
   const costPerTurnover = active.length ? +(cleaningExp / active.length).toFixed(2) : 0;
   const rev = y => all.filter(b => b.status !== 'cancelled' && (b.check_in || '').slice(0, 4) === String(y)).reduce((a, b) => a + (b.amount || 0) + (b.upsell_total || 0), 0);
   const revThis = rev(year), revLast = rev(year - 1);
@@ -2056,7 +2064,8 @@ function computeMetrics(year) {
 }
 app.get('/api/financials', (req, res) => {
   const year = Number(req.query.year) || new Date().getFullYear();
-  ok(res, { ...computeFinancials(year), metrics: computeMetrics(year) });
+  const propertyId = req.query.property_id ? Number(req.query.property_id) : null;
+  ok(res, { ...computeFinancials(year, propertyId), metrics: computeMetrics(year, propertyId), property_id: propertyId });
 });
 
 // ---------- ORPHAN / GAP NIGHTS ----------
@@ -2118,6 +2127,216 @@ function computePotentialRevenue(propIds, start, end, adrByProp, minStay) {
   }
   return { total: +total.toFixed(2), fillable_nights: totalNights, min_stay: minStay, start, end, by_property: by_property.sort((a, b) => b.potential_revenue - a.potential_revenue) };
 }
+
+// ---------- PER-PROPERTY PERFORMANCE STATS ----------
+// Occupied-night sets per property from the reconciled calendar (bookings + platform
+// reservations, mirrors already collapsed) — includes past years, so YOY works.
+function occupiedNightSets() {
+  const occ = {};
+  for (const e of buildCalendarEvents()) {
+    if ((e.kind !== 'booking' && e.kind !== 'reserved') || !e.start) continue;
+    let d = e.start; const end = effEnd(e.start, e.end);
+    while (d < end) { (occ[e.property_id] = occ[e.property_id] || new Set()).add(d); d = addDays(d, 1); }
+  }
+  return occ;
+}
+function countOccupiedNights(occSet, start, end) {
+  if (!occSet) return 0;
+  let n = 0, d = start;
+  while (d < end) { if (occSet.has(d)) n++; d = addDays(d, 1); }
+  return n;
+}
+// Revenue allocated per-night from real bookings inside [start, end). Platform
+// "reserved" events carry no amount, so revenue comes from bookings only.
+function revenueInWindow(bookings, pid, start, end) {
+  let rev = 0, nights = 0;
+  for (const b of bookings) {
+    if (b.property_id !== pid || !b.check_in) continue;
+    const nw = nightsInWindow(b.check_in, b.check_out, start, end);
+    if (!nw) continue;
+    const len = daysBetween(b.check_in, b.check_out || b.check_in);
+    rev += ((b.amount || 0) + (b.upsell_total || 0)) / len * nw;
+    nights += nw;
+  }
+  return { revenue: +rev.toFixed(2), nights };
+}
+// Vacant Friday/Saturday nights in [start, end) — prime inventory going unsold.
+function vacantWeekendNights(occSet, start, end) {
+  let n = 0, d = start;
+  while (d < end) {
+    const dow = new Date(d + 'T00:00:00Z').getUTCDay();
+    if ((dow === 5 || dow === 6) && !(occSet && occSet.has(d))) n++;
+    d = addDays(d, 1);
+  }
+  return n;
+}
+function getListingMeta(pid) {
+  const v = getSetting('listing_meta_' + pid, null);
+  return (v && typeof v === 'object') ? v : { headline: '', description: '', amenities: '', target_guest: '' };
+}
+function computePropertyStats() {
+  const today = new Date().toISOString().slice(0, 10);
+  const year = Number(today.slice(0, 4));
+  const occ = occupiedNightSets();
+  const bookings = tableAll('bookings').map(joinBooking).filter(b => b.status !== 'cancelled' && b.check_in);
+  const seasonStart = `${year}-${getSetting('season_start_md', '06-01')}`;
+  const seasonEnd = `${year}-${getSetting('season_end_md', '10-01')}`;
+
+  // Fallback ADR for the potential-revenue projection: season achieved rate.
+  const adrByProp = {};
+  for (const p of tableAll('properties')) {
+    const s = revenueInWindow(bookings, p.id, seasonStart, seasonEnd);
+    adrByProp[p.id] = s.nights ? +(s.revenue / s.nights).toFixed(2) : 0;
+  }
+
+  return tableAll('properties').sort((a, b) => (a.nickname || '').localeCompare(b.nickname || '')).map(p => {
+    const windows = {};
+    for (const w of [14, 30, 60]) {
+      const end = addDays(today, w);
+      const nights = countOccupiedNights(occ[p.id], today, end);
+      const rw = revenueInWindow(bookings, p.id, today, end);
+      const pot = computePotentialRevenue([p.id], today, end, adrByProp, 3).by_property[0] || {};
+      windows['next_' + w] = {
+        days: w,
+        occupied_nights: nights,
+        occupancy: +(nights / w).toFixed(3),
+        revenue: rw.revenue,
+        adr: rw.nights ? +(rw.revenue / rw.nights).toFixed(2) : null,
+        potential_revenue: pot.potential_revenue || 0,
+        fillable_nights: pot.fillable_nights || 0,
+        vacant_weekend_nights: vacantWeekendNights(occ[p.id], today, end),
+      };
+    }
+
+    // July + August — the money window (62 days).
+    const jaStart = `${year}-07-01`, jaEnd = `${year}-09-01`, jaDays = 62;
+    const jaNights = countOccupiedNights(occ[p.id], jaStart, jaEnd);
+    const jaRev = revenueInWindow(bookings, p.id, jaStart, jaEnd);
+    const lyJaNights = countOccupiedNights(occ[p.id], `${year - 1}-07-01`, `${year - 1}-09-01`);
+    const lyJaRev = revenueInWindow(bookings, p.id, `${year - 1}-07-01`, `${year - 1}-09-01`);
+
+    // Whole season, this year vs last.
+    const seasonRev = revenueInWindow(bookings, p.id, seasonStart, seasonEnd);
+    const lySeasonStart = `${year - 1}${seasonStart.slice(4)}`, lySeasonEnd = `${year - 1}${seasonEnd.slice(4)}`;
+    const lySeasonRev = revenueInWindow(bookings, p.id, lySeasonStart, lySeasonEnd);
+    const adrAchieved = seasonRev.nights ? +(seasonRev.revenue / seasonRev.nights).toFixed(2) : null;
+    const lyAdr = lySeasonRev.nights ? +(lySeasonRev.revenue / lySeasonRev.nights).toFixed(2) : null;
+
+    // Average PriceLabs recommended rate over the next 30 days (if cached).
+    const plNext30 = store.price_cache.filter(c => c.property_id === p.id && c.date >= today && c.date < addDays(today, 30));
+    const plAvg30 = plNext30.length ? +(plNext30.reduce((a, c) => a + (Number(c.recommended_price) || 0), 0) / plNext30.length).toFixed(2) : null;
+
+    return {
+      id: p.id, nickname: p.nickname,
+      listing: getListingMeta(p.id),
+      windows,
+      july_august: {
+        days: jaDays,
+        occupied_nights: jaNights,
+        occupancy: +(jaNights / jaDays).toFixed(3),
+        revenue: jaRev.revenue,
+        last_year: {
+          occupied_nights: lyJaNights,
+          occupancy: +(lyJaNights / jaDays).toFixed(3),
+          revenue: lyJaRev.revenue,
+        },
+      },
+      season: {
+        start: seasonStart, end: seasonEnd,
+        revenue: seasonRev.revenue, nights: seasonRev.nights, adr_achieved: adrAchieved,
+        last_year: { revenue: lySeasonRev.revenue, nights: lySeasonRev.nights, adr: lyAdr },
+        yoy_revenue_pct: lySeasonRev.revenue > 0 ? +(((seasonRev.revenue - lySeasonRev.revenue) / lySeasonRev.revenue)).toFixed(3) : null,
+      },
+      pricelabs_avg_next_30: plAvg30,
+    };
+  });
+}
+app.get('/api/property-stats', (req, res) => ok(res, {
+  generated_at: nowIso(),
+  today: new Date().toISOString().slice(0, 10),
+  properties: computePropertyStats(),
+}));
+
+// Listing copy (headline/description/amenities) lives in settings — used by Insights.
+app.put('/api/properties/:id/listing-meta', (req, res) => {
+  const p = tableFind('properties', req.params.id);
+  if (!p) return err(res, 404, 'property not found');
+  const b = req.body || {};
+  const meta = {
+    headline: String(b.headline || ''),
+    description: String(b.description || ''),
+    amenities: String(b.amenities || ''),
+    target_guest: String(b.target_guest || ''),
+  };
+  const key = 'listing_meta_' + p.id;
+  const existing = store.settings.find(s => s.key === key);
+  if (existing) tableUpdate('settings', existing.id, { value: meta }); else tableInsert('settings', { key, value: meta });
+  ok(res, meta);
+});
+
+// ---------- INSIGHTS ----------
+// Rule-based, data-driven recommendations per property. severity: 'act' | 'watch' | 'good'.
+function computeInsights() {
+  const stats = computePropertyStats();
+  const orphans = computeOrphans(2);
+  const reviews = tableAll('reviews');
+  const today = new Date().toISOString().slice(0, 10);
+  const out = [];
+  for (const s of stats) {
+    const tips = [];
+    const w14 = s.windows.next_14, w30 = s.windows.next_30, w60 = s.windows.next_60;
+
+    if (w14.occupancy < 0.4) {
+      tips.push({ severity: 'act', title: `Next 14 days are ${Math.round(w14.occupancy * 100)}% booked`, detail: `Only ${w14.occupied_nights} of 14 nights are filled. This inventory expires worthless — consider a short-lead discount (10–15%), opening 2-night minimums, or a direct-booking promo to past guests. Filling the 3+ night gaps alone is worth ~${Math.round(w14.potential_revenue)}$.` });
+    } else if (w14.occupancy >= 0.75) {
+      tips.push({ severity: 'good', title: `Strong next 2 weeks (${Math.round(w14.occupancy * 100)}% booked)`, detail: `With ${w14.occupied_nights}/14 nights sold, you have pricing power — nudge rates up on the remaining nights rather than discounting.` });
+    }
+
+    if (w30.vacant_weekend_nights >= 3) {
+      tips.push({ severity: 'act', title: `${w30.vacant_weekend_nights} weekend nights unsold in the next 30 days`, detail: `Fri/Sat nights are your premium inventory. Target these first: SMS your repeat guests (Mailing List tab), and check the rate isn't above PriceLabs' recommendation${s.pricelabs_avg_next_30 ? ` (~$${s.pricelabs_avg_next_30}/night rec. avg)` : ''}.` });
+    }
+
+    if (w30.adr != null && s.season.adr_achieved != null) {
+      const diff = (w30.adr - s.season.adr_achieved) / s.season.adr_achieved;
+      if (diff < -0.12) tips.push({ severity: 'watch', title: `Forward rate is ${Math.abs(Math.round(diff * 100))}% below your achieved $${s.season.adr_achieved}/night`, detail: `Bookings in the next 30 days average $${w30.adr}/night vs $${s.season.adr_achieved} achieved this season. If demand is holding, you may be underpricing the remaining nights.` });
+      else if (diff > 0.15) tips.push({ severity: 'good', title: `Forward ADR $${w30.adr} runs ${Math.round(diff * 100)}% above season average`, detail: `Upcoming stays are booking at richer rates than the season average of $${s.season.adr_achieved} — hold the line on pricing.` });
+    }
+    if (s.pricelabs_avg_next_30 != null && w30.adr != null) {
+      const gap = (w30.adr - s.pricelabs_avg_next_30) / s.pricelabs_avg_next_30;
+      if (gap < -0.15) tips.push({ severity: 'watch', title: `Booked rate ~${Math.abs(Math.round(gap * 100))}% under PriceLabs market rec`, detail: `Next-30-day booked ADR is $${w30.adr} vs a $${s.pricelabs_avg_next_30} recommended average — review minimum prices so early bookers aren't scooping undervalued nights.` });
+    }
+
+    const ja = s.july_august;
+    if (ja.last_year.occupied_nights > 0) {
+      const paceDelta = ja.occupancy - ja.last_year.occupancy;
+      if (paceDelta < -0.1) tips.push({ severity: 'act', title: `July/Aug pacing behind last year (${Math.round(ja.occupancy * 100)}% vs ${Math.round(ja.last_year.occupancy * 100)}%)`, detail: `Last year July+Aug finished with ${ja.last_year.occupied_nights}/62 nights and $${Math.round(ja.last_year.revenue)}. You're at ${ja.occupied_nights}/62 and $${Math.round(ja.revenue)} — close the gap with mid-week deals or a minimum-stay reduction.` });
+      else if (paceDelta > 0.05) tips.push({ severity: 'good', title: `July/Aug ahead of last year (${Math.round(ja.occupancy * 100)}% vs ${Math.round(ja.last_year.occupancy * 100)}%)`, detail: `Revenue $${Math.round(ja.revenue)} vs $${Math.round(ja.last_year.revenue)} at last year's close — momentum is real; consider raising weekend rates.` });
+    }
+
+    const myOrphans = orphans.filter(o => o.property_id === s.id);
+    if (myOrphans.length >= 2) {
+      tips.push({ severity: 'watch', title: `${myOrphans.length} orphan gaps (1–2 nights) on the calendar`, detail: `Short unbookable gaps between stays: ${myOrphans.slice(0, 3).map(o => `${o.gap_start} (${o.nights}n)`).join(', ')}${myOrphans.length > 3 ? '…' : ''}. Offer late-checkout/early-check-in upsells, or open 1–2 night stays with a higher nightly rate to monetize them.` });
+    }
+
+    const myReviews = reviews.filter(r => r.property_id === s.id);
+    if (myReviews.length) {
+      const avg = myReviews.reduce((a, r) => a + (Number(r.rating) || 0), 0) / myReviews.length;
+      if (avg < 4.5) tips.push({ severity: 'watch', title: `Average review ${avg.toFixed(1)}★`, detail: `Below the 4.7★ Airbnb "Guest favourite" bar — read recent review text for repeat complaints; small fixes (wifi, mattress, coffee) move ratings fastest.` });
+    }
+
+    if (!s.listing.headline && !s.listing.description) {
+      tips.push({ severity: 'watch', title: 'No listing headline/description saved', detail: 'Add your live listing copy via the "Listing" button on the Properties tab — future insights can then critique positioning, amenities, and target guest fit.' });
+    }
+
+    if (w60.potential_revenue > 0) {
+      tips.push({ severity: 'watch', title: `$${Math.round(w60.potential_revenue)} still on the table in the next 60 days`, detail: `${w60.fillable_nights} vacant nights sit in fillable 3+ night blocks. That's the upside if you fill them at ${w60.adr ? 'current booked rates' : 'season-average rates'}.` });
+    }
+
+    out.push({ id: s.id, nickname: s.nickname, stats: s, insights: tips });
+  }
+  return { generated_at: nowIso(), today, properties: out };
+}
+app.get('/api/insights', (req, res) => ok(res, computeInsights()));
 
 // ---------- ANNUAL PREDICTION (per-property monthly revenue forecast) ----------
 app.get('/api/annual-prediction', (req, res) => {
