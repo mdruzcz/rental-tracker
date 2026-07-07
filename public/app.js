@@ -2890,12 +2890,28 @@ Matt`;
     pnl.appendChild(roiEditLine('Other income' + (inp.other_income_note ? ` — ${inp.other_income_note}` : ''), otherIncome));
     pnl.appendChild(roLine('Total income (booked)', c.total_income, 'roi-total'));
 
-    // Forecast lines → trending
+    // Forecast lines → trending. Each off-season month is editable individually
+    // (e.g. long-term tenant rent Jan–May); trending uses max(booked, forecast) per month.
     pnl.appendChild(el('h3', { style: 'margin-top:12px;' }, 'Forecast (feeds the trending number)'));
-    const fcPre = roiInput(inp.forecast_preseason_income);
-    const fcPost = roiInput(inp.forecast_offseason_income);
-    pnl.appendChild(roiEditLine('Forecast income before season ($/yr)', fcPre));
-    pnl.appendChild(roiEditLine('Forecast income after season, Oct–Dec ($/yr)', fcPost));
+    const fc = c.forecast || { pre_months: [], post_months: [] };
+    if (fc.legacy_mode) {
+      pnl.appendChild(el('div', { class: 'muted', style: 'font-size:12px;padding:2px 0;' },
+        'Currently using your old single pre/post-season figures — enter monthly amounts below and Save to switch to per-month forecasting.'));
+    }
+    const fcInputs = {};
+    const fcMonthRow = (title, months, total) => {
+      const row = el('div', { class: 'roi-fc-months' });
+      months.forEach(r => {
+        const i = el('input', { type: 'number', step: '0.01', value: r.forecast ? String(r.forecast) : '', placeholder: r.actual ? String(Math.round(r.actual)) : '0', title: r.label + (r.actual ? ` — ${fmtMoney(r.actual)} already booked; trending uses the higher of booked vs forecast` : ' — nothing booked yet') });
+        fcInputs[r.month] = i;
+        row.appendChild(el('div', { class: 'roi-fc-month' }, el('span', null, r.label), i));
+      });
+      return el('div', { class: 'roi-fc-group' },
+        el('div', { class: 'stat-line' }, el('span', null, title), el('strong', null, fmtMoney(total || 0))),
+        row);
+    };
+    pnl.appendChild(fcMonthRow('Before season — monthly (LTR rent, winter stays…)', fc.pre_months, fc.pre_total));
+    pnl.appendChild(fcMonthRow('After season — monthly (Oct–Dec)', fc.post_months, fc.post_total));
     pnl.appendChild(roLine('Remaining season potential (3+ night gaps)', c.potential_remaining_season));
     pnl.appendChild(roLine('Trending income (gaps fill + forecasts land)', t.income, 'roi-total'));
 
@@ -2936,10 +2952,11 @@ Matt`;
       `Equity ${money(c.equity)} • return basis: ${c.cash_basis}. Cash flow is NOI minus interest only — principal paydown builds equity on top. Trending assumes the remaining 3+ night season blocks fill and off-season forecasts land (uses whichever is higher: booked or forecast).`));
     const saveBtn = el('button', { class: 'btn-primary', style: 'margin-top:12px;' }, 'Save ' + b.name);
     saveBtn.addEventListener('click', async () => {
+      const forecast_monthly = {};
+      for (const m of Object.keys(fcInputs)) forecast_monthly[m] = Number(fcInputs[m].value) || 0;
       const payload = {
         other_income: Number(otherIncome.value) || 0,
-        forecast_preseason_income: Number(fcPre.value) || 0,
-        forecast_offseason_income: Number(fcPost.value) || 0,
+        forecast_monthly,
         property_value: Number(value.value) || 0,
         debt_balance: Number(debt.value) || 0,
         mortgage_rate_pct: Number(rate.value) || 0,

@@ -2442,10 +2442,34 @@ function computeRoi(year) {
     const mortgage_interest = +(override > 0 ? override : debt * rate / 100 * ownedFraction).toFixed(2);
     const cash_flow = +(noi - mortgage_interest).toFixed(2);
 
-    // Trending / forecast: season books out its 3+ night gaps, and the off-season windows
-    // hit your forecast (whichever is higher — already-booked or forecast).
-    const fcPre = Math.max(num(inp.forecast_preseason_income), segments.pre.revenue);
-    const fcPost = Math.max(num(inp.forecast_offseason_income), segments.post.revenue);
+    // Trending / forecast: season books out its 3+ night gaps, and each off-season MONTH
+    // hits your forecast (per-month, whichever is higher — already-booked or forecast).
+    // Off-season months are editable individually so long-term tenant rent (e.g. 4488's
+    // Jan–May tenants) can be entered month by month. Legacy single-figure fields are
+    // honoured when no monthly forecast has been saved.
+    const seasonStartMonth = Number(seasonStart.slice(5, 7));
+    const seasonEndMonth = Number(seasonEnd.slice(5, 7));
+    const preMonthNums = []; for (let m = 1; m < seasonStartMonth; m++) preMonthNums.push(m);
+    const postMonthNums = []; for (let m = seasonEndMonth; m <= 12; m++) postMonthNums.push(m);
+    const fmRaw = (inp.forecast_monthly && typeof inp.forecast_monthly === 'object') ? inp.forecast_monthly : null;
+    const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const fcMonth = m => fmRaw ? num(fmRaw[m]) : null;
+    const monthRow = m => ({ month: m, label: MONTH_LABELS[m - 1], actual: monthly_total[m - 1], forecast: fcMonth(m) ?? 0, used: Math.max(monthly_total[m - 1], fcMonth(m) ?? 0) });
+    let pre_months = preMonthNums.map(monthRow);
+    let post_months = postMonthNums.map(monthRow);
+    // Legacy fallback: an old single pre/post figure spreads over its window for trending.
+    if (!fmRaw && num(inp.forecast_preseason_income)) {
+      const used = Math.max(num(inp.forecast_preseason_income), segments.pre.revenue);
+      pre_months = pre_months.map(r => ({ ...r, forecast: null }));
+      pre_months._legacyTotal = used;
+    }
+    if (!fmRaw && num(inp.forecast_offseason_income)) {
+      const used = Math.max(num(inp.forecast_offseason_income), segments.post.revenue);
+      post_months = post_months.map(r => ({ ...r, forecast: null }));
+      post_months._legacyTotal = used;
+    }
+    const fcPre = pre_months._legacyTotal != null ? pre_months._legacyTotal : +pre_months.reduce((a, r) => a + r.used, 0).toFixed(2);
+    const fcPost = post_months._legacyTotal != null ? post_months._legacyTotal : +post_months.reduce((a, r) => a + r.used, 0).toFixed(2);
     const trending_income = +(fcPre + segments.season.revenue + potential_remaining_season + fcPost + other_income).toFixed(2);
     const trending_noi = +(trending_income - total_opex).toFixed(2);
     const trending_cash_flow = +(trending_noi - mortgage_interest).toFixed(2);
@@ -2469,6 +2493,12 @@ function computeRoi(year) {
           income: trending_income, noi: trending_noi, cash_flow: trending_cash_flow,
           cash_on_cash: cashBase > 0 ? +(trending_cash_flow / cashBase).toFixed(4) : null,
           preseason_used: +fcPre.toFixed(2), postseason_used: +fcPost.toFixed(2),
+        },
+        forecast: {
+          pre_months: pre_months.map(r => ({ month: r.month, label: r.label, actual: r.actual, forecast: r.forecast, used: r.used })),
+          post_months: post_months.map(r => ({ month: r.month, label: r.label, actual: r.actual, forecast: r.forecast, used: r.used })),
+          pre_total: +fcPre.toFixed(2), post_total: +fcPost.toFixed(2),
+          legacy_mode: !fmRaw && !!(num(inp.forecast_preseason_income) || num(inp.forecast_offseason_income)),
         },
         cap_rate: value > 0 ? +(noi / value).toFixed(4) : null,
         cash_on_cash: cashBase > 0 ? +(cash_flow / cashBase).toFixed(4) : null,

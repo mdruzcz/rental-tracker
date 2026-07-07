@@ -640,3 +640,9 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .roi-monthly { margin: 4px 0 8px; }
 .roi-monthly-table { font-size: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
 .roi-monthly-table th, .roi-monthly-table td { padding: 5px 10px; }
+
+/* ROI per-month forecast inputs */
+.roi-fc-group { padding: 4px 0; border-bottom: 1px dashed var(--border); }
+.roi-fc-months { display: flex; gap: 6px; flex-wrap: wrap; padding: 4px 0 6px; }
+.roi-fc-month { display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 10px; font-weight: 650; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.roi-fc-month input { width: 72px; padding: 4px 6px; font-size: 12px; text-align: right; }
