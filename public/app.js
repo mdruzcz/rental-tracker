@@ -3005,10 +3005,22 @@ Matt`;
     for (const p of data.properties) {
       const card = el('div', { class: 'card' });
       const s = p.stats;
+      const w14 = s.windows.next_14, w30 = s.windows.next_30, ja = s.july_august;
       card.appendChild(el('div', { class: 'between' },
         el('h2', null, p.nickname),
-        el('div', { class: 'muted', style: 'font-size:12px;' },
-          `next 30d: ${pct(s.windows.next_30.occupancy)} booked • ${fmtMoney(s.windows.next_30.revenue)} on the books • July/Aug ${pct(s.july_august.occupancy)} vs LY ${pct(s.july_august.last_year.occupancy)}`)));
+        el('div', { class: 'muted', style: 'font-size:12px;' }, `${fmtMoney(w30.revenue)} on the books next 30 days`)));
+      // KPI strip: the numbers we manage the business by.
+      const kpiCell = (label, value, sub, occ) => el('div', { class: 'stat-window' },
+        el('div', { class: 'label' }, label),
+        el('div', { class: 'value' }, value),
+        occ != null ? occBar(occ) : null,
+        el('div', { class: 'sub' }, sub));
+      card.appendChild(el('div', { class: 'stat-windows', style: 'margin-bottom:8px;' },
+        kpiCell('Next 14 days', pct(w14.occupancy), `${w14.occupied_nights}/14 nights booked`, w14.occupancy),
+        kpiCell('Next 30 days', pct(w30.occupancy), `${w30.occupied_nights}/30 nights booked`, w30.occupancy),
+        kpiCell('Summer · Jul–Aug', pct(ja.occupancy), `${ja.occupied_nights}/${ja.days} nights • LY ${pct(ja.last_year.occupancy)}`, ja.occupancy),
+        kpiCell('Revenue / night', s.season.adr_achieved != null ? fmtMoney(s.season.adr_achieved) : '—',
+          w30.adr != null ? `next 30d bookings ${fmtMoney(w30.adr)}` : 'no upcoming bookings', null)));
       if (!p.insights.length) {
         card.appendChild(el('div', { class: 'empty' }, 'Nothing urgent — this property looks healthy.'));
       } else {
