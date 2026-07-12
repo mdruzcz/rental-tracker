@@ -2612,11 +2612,18 @@ function computeInsights() {
       tips.push({ severity: 'act', title: `Cash-flow negative: ${fmt$(c.cash_flow)} this year so far`, detail: `Income ${fmt$(c.total_income)} minus operating costs ${fmt$(c.total_opex)} and mortgage interest ${fmt$(c.mortgage_interest)} leaves a shortfall — and even the trending view (season gaps filled + off-season forecast) stays negative at ${fmt$(c.trending ? c.trending.cash_flow : 0)}. Something structural needs to change: rates, off-season income, or a cost line.` });
     } else if (c.cash_flow > 0 && c.cash_on_cash != null) {
       const pct = Math.round(c.cash_on_cash * 1000) / 10;
-      const sev = c.cash_on_cash >= 0.08 ? 'good' : 'watch';
-      tips.push({ severity: sev, title: `${pct}% cash-on-cash return (${c.cash_basis})`, detail: `${fmt$(c.cash_flow)} annual cash flow on ${fmt$(Number(b.inputs.cash_invested) > 0 ? Number(b.inputs.cash_invested) : c.equity)} ${c.cash_basis}. ${c.cash_on_cash >= 0.08 ? 'Above the ~8% bar most investors want from active STRs.' : 'Below the ~8% most investors target for the work an STR takes — push occupancy or trim the biggest cost line.'}` });
+      const tcoc = c.trending ? c.trending.cash_on_cash : null;
+      const judged = tcoc != null ? Math.max(c.cash_on_cash, tcoc) : c.cash_on_cash;
+      const sev = judged >= 0.08 ? 'good' : 'watch';
+      const trendTxt = (tcoc != null && Math.abs(tcoc - c.cash_on_cash) >= 0.01)
+        ? ` Trending ${Math.round(tcoc * 1000) / 10}% (${fmt$(c.trending.cash_flow)}) once season gaps fill and the off-season forecast lands.` : '';
+      tips.push({ severity: sev, title: `${pct}% cash-on-cash booked so far (${c.cash_basis})`, detail: `${fmt$(c.cash_flow)} cash flow booked to date on ${fmt$(Number(b.inputs.cash_invested) > 0 ? Number(b.inputs.cash_invested) : c.equity)} ${c.cash_basis}.${trendTxt} ${judged >= 0.08 ? 'Above the ~8% bar most investors want from active STRs.' : 'Below the ~8% most investors target for the work an STR takes — push occupancy or trim the biggest cost line.'}` });
     }
-    if (c.total_income > 0 && c.mortgage_interest > 0 && c.mortgage_interest / c.total_income > 0.4) {
-      tips.push({ severity: 'watch', title: `Mortgage interest eats ${Math.round(c.mortgage_interest / c.total_income * 100)}% of income`, detail: `${fmt$(c.mortgage_interest)} of interest against ${fmt$(c.total_income)} income (${c.interest_source}). Refinancing or paying down principal moves this number more than any nightly-rate tweak.` });
+    // Interest share is judged against the trending year, not the season-to-date number —
+    // otherwise every building looks over-leveraged in July.
+    const incBase = Math.max(c.total_income, (c.trending && c.trending.income) || 0);
+    if (incBase > 0 && c.mortgage_interest > 0 && c.mortgage_interest / incBase > 0.4) {
+      tips.push({ severity: 'watch', title: `Mortgage interest eats ${Math.round(c.mortgage_interest / incBase * 100)}% of trending income`, detail: `${fmt$(c.mortgage_interest)} of interest against ${fmt$(incBase)} trending income (${c.interest_source}). Refinancing or paying down principal moves this number more than any nightly-rate tweak.` });
     }
     if (!Number(b.inputs.property_value) || (!Number(b.inputs.debt_balance) && !Number(b.inputs.mortgage_interest_override))) {
       tips.push({ severity: 'watch', title: 'P&L incomplete — missing value or mortgage inputs', detail: `Fill in property value, mortgage balance and rate on the ROI tab so cap rate and cash-on-cash can be computed. ${(b.inputs.notes || '').includes('ESTIMATE') ? 'Expense lines are currently estimates.' : ''}` });
