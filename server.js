@@ -1276,8 +1276,28 @@ app.delete('/api/blocks/:id', (req, res) => {
 function icsEscape(s) { return String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\r?\n/g, '\\n'); }
 function icsDate(iso) { return (iso || '').replace(/-/g, ''); }
 function slugForFile(s) { return String(s || 'property').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'property'; }
-function buildPropertyIcs(property) {
-  const events = buildCalendarEvents().filter(e => e.property_id === property.id && (e.kind === 'booking' || e.kind === 'reserved' || e.kind === 'block'));
+// Which platform an occupied span ORIGINATED on (null = direct/manual/no single origin).
+// Used to build per-platform feeds: the feed you give VRBO must not echo VRBO's own
+// reservations back at it, or every stay shows up twice and conflicts with itself.
+function eventOriginPlatform(e) {
+  if (e.kind === 'reserved') return (e.source || '').toLowerCase() || null;
+  if (e.kind === 'booking') {
+    if (e.synced_source) return e.synced_source.toLowerCase();          // matched to a platform feed this sync
+    if (e.source_uid) return claimedPlatformOf(e.source_uid);           // claimed from a platform reservation
+    const s = (e.source || '').toLowerCase();
+    if (s === 'airbnb' || s === 'vrbo') return s;                       // typed as that channel's booking
+    return null;                                                        // Private / Cottages / manual
+  }
+  if (e.kind === 'block') {
+    if (e.manual) return null;                                          // owner block — every platform needs it
+    const srcs = (e.source || '').toLowerCase().split('/').filter(Boolean);
+    return srcs.length === 1 ? srcs[0] : null;                          // single-platform block echoes; merged ones don't
+  }
+  return null;
+}
+function buildPropertyIcs(property, excludePlatform) {
+  const events = buildCalendarEvents().filter(e => e.property_id === property.id && (e.kind === 'booking' || e.kind === 'reserved' || e.kind === 'block'))
+    .filter(e => !excludePlatform || eventOriginPlatform(e) !== excludePlatform);
   const stamp = nowIso().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
   const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Rental Tracker//EN', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH',
     'X-WR-CALNAME:' + icsEscape(property.nickname + ' availability')];
@@ -1300,9 +1320,13 @@ app.get('/api/public/ical/:pid.ics', (req, res) => {
   const property = tableFind('properties', req.params.pid);
   if (!property) return res.status(404).type('text/plain').send('not found');
   if (!property.ical_token || req.query.token !== property.ical_token) return res.status(403).type('text/plain').send('forbidden');
+  // ?for=vrbo → the feed VRBO imports (excludes VRBO-origin stays so they don't echo).
+  // ?for=airbnb → likewise for Airbnb. No param → full feed (Cottages Canada etc.).
+  const forPlatform = String(req.query.for || req.query.exclude || '').toLowerCase();
+  const exclude = (forPlatform === 'airbnb' || forPlatform === 'vrbo') ? forPlatform : null;
   res.set('Content-Type', 'text/calendar; charset=utf-8');
   res.set('Content-Disposition', 'inline; filename="' + slugForFile(property.nickname) + '.ics"');
-  res.send(buildPropertyIcs(property));
+  res.send(buildPropertyIcs(property, exclude));
 });
 
 // ---------- LONG-TERM RENTAL (off-season tenancy: listings, photos, applicants) ----------

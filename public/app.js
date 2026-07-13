@@ -779,12 +779,21 @@
     form.appendChild(formField('Airbnb iCal URL', input('airbnb_ical_url', { value: p?.airbnb_ical_url, placeholder: 'https://www.airbnb.com/calendar/ical/…' }), { full: true }));
     form.appendChild(formField('VRBO iCal URL', input('vrbo_ical_url', { value: p?.vrbo_ical_url, placeholder: 'http://www.vrbo.com/icalendar/…' }), { full: true }));
     if (p && p.id && p.ical_token) {
-      const feedUrl = location.origin + '/api/public/ical/' + p.id + '.ics?token=' + p.ical_token;
-      const feedInput = el('input', { type: 'text', value: feedUrl, readonly: 'true', style: 'flex:1;min-width:0;' });
-      feedInput.addEventListener('click', () => feedInput.select());
-      const copyBtn = el('button', { class: 'btn-ghost small', type: 'button', onclick: () => { navigator.clipboard && navigator.clipboard.writeText(feedUrl); toast('Feed URL copied', 'success'); } }, 'Copy');
-      form.appendChild(formField('⬆ Export feed (.ics) — paste into Airbnb / VRBO / Cottages Canada to block all your booked dates',
-        el('div', { style: 'display:flex;gap:8px;align-items:center;' }, feedInput, copyBtn), { full: true }));
+      const baseUrl = location.origin + '/api/public/ical/' + p.id + '.ics?token=' + p.ical_token;
+      const feedRow = (label, url) => {
+        const feedInput = el('input', { type: 'text', value: url, readonly: 'true', style: 'flex:1;min-width:0;font-size:12px;' });
+        feedInput.addEventListener('click', () => feedInput.select());
+        const copyBtn = el('button', { class: 'btn-ghost small', type: 'button', onclick: () => { navigator.clipboard && navigator.clipboard.writeText(url); toast(label + ' feed URL copied', 'success'); } }, 'Copy');
+        return el('div', { style: 'display:flex;gap:8px;align-items:center;margin-bottom:6px;' },
+          el('span', { class: 'muted', style: 'width:130px;flex:0 0 auto;font-size:12px;' }, label), feedInput, copyBtn);
+      };
+      form.appendChild(formField('⬆ Export feeds (.ics) — each platform gets ITS OWN link so its bookings aren’t echoed back as conflicts',
+        el('div', null,
+          feedRow('Paste into VRBO', baseUrl + '&for=vrbo'),
+          feedRow('Paste into Airbnb', baseUrl + '&for=airbnb'),
+          feedRow('Everything else', baseUrl),
+          el('div', { class: 'muted', style: 'font-size:12px;' }, 'The VRBO link hides VRBO-origin stays (it already has those), the Airbnb link hides Airbnb-origin stays. Use the full feed for Cottages Canada or anywhere that has no bookings of its own.')),
+        { full: true }));
     }
     form.appendChild(formField('Welcome message (SMS greeting sent to guests)',
       textarea('welcome_message', p?.welcome_message, { rows: 3, placeholder: 'e.g. "Welcome back! The kayak is yours, the firewood is by the shed, and the WiFi password is on the fridge."' }),
