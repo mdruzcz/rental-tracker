@@ -2658,7 +2658,94 @@ function computeInsights() {
     return { key: b.key, name: b.name, sub: b.sub, computed: c, insights: tips };
   }).filter(Boolean);
 
-  return { generated_at: nowIso(), today, properties: out, buildings, roi_year: roi.year };
+  return { generated_at: nowIso(), today, properties: out, buildings, roi_year: roi.year, next_season: computeNextSeasonPlan(stats, today) };
+}
+
+// ---------- NEXT-SEASON PLANNING ----------
+// Data-derived lessons from THIS season that only pay off if acted on before the next one:
+// listing launch timing, channel gaps vs last year, rate positioning, booking-window
+// expectations, shoulder-season upside, off-season tenancies, and direct-booking share.
+function computeNextSeasonPlan(stats, today) {
+  const year = Number(today.slice(0, 4));
+  const tips = [];
+  const fmt$ = n => '$' + Math.round(n).toLocaleString('en-CA');
+  const bookings = tableAll('bookings').map(joinBooking).filter(b => b.status !== 'cancelled' && b.check_in);
+  const occ = occupiedNightSets();
+
+  // 1) Late listing launches: little June inventory sold but a real August — the listing
+  //    simply wasn't live (or wasn't ranking) when early birds were shopping.
+  for (const s of stats) {
+    const junNights = countOccupiedNights(occ[s.id], `${year}-06-01`, `${year}-07-01`);
+    const augOcc = countOccupiedNights(occ[s.id], `${year}-08-01`, `${year}-09-01`) / 31;
+    if (junNights <= 6 && augOcc >= 0.4 && s.season.adr_achieved) {
+      const lost = (30 - junNights) * 0.6 * s.season.adr_achieved; // ~60% of vacant June nights were sellable
+      tips.push({ severity: 'act', title: `${s.nickname}: be live and bookable by May 1 next year`, detail: `June ${year} sold only ${junNights} nights while August reached ${Math.round(augOcc * 100)}% — the demand existed, but the unit wasn't capturing it (late listing launch, or a tenant hand-off eating into June). At the achieved ${fmt$(s.season.adr_achieved)}/night, a full June is worth roughly ${fmt$(lost)}. Set winter-tenant end dates and listing go-live so the calendar is open before early birds book in April/May.` });
+    }
+  }
+
+  // 2) Channels that produced last year but are dark this year.
+  const chanRev = (pid, y) => {
+    const m = {};
+    bookings.filter(b => b.property_id === pid && b.check_in.slice(0, 4) === String(y))
+      .forEach(b => { const k = b.booking_type_name || 'Other'; m[k] = (m[k] || 0) + (b.amount || 0) + (b.upsell_total || 0); });
+    return m;
+  };
+  for (const s of stats) {
+    const ly = chanRev(s.id, year - 1), ty = chanRev(s.id, year);
+    for (const [chan, rev] of Object.entries(ly)) {
+      if (rev >= 1000 && (ty[chan] || 0) < rev * 0.2) {
+        tips.push({ severity: 'act', title: `${s.nickname}: ${chan} went dark (${fmt$(rev)} last year → ${fmt$(ty[chan] || 0)})`, detail: `That channel produced real money in ${year - 1} and nearly nothing in ${year}. Confirm the listing is live, renewed and rate-loaded there before next spring — channel diversity is cheap occupancy insurance.` });
+      }
+    }
+  }
+
+  // 3) Rate positioning vs market recommendation (only when meaningfully under).
+  for (const s of stats) {
+    const w30 = s.windows.next_30;
+    if (s.pricelabs_avg_next_30 && w30.adr && w30.adr < s.pricelabs_avg_next_30 * 0.85 && w30.occupancy >= 0.6) {
+      tips.push({ severity: 'watch', title: `${s.nickname}: filling up while priced ~${Math.round((1 - w30.adr / s.pricelabs_avg_next_30) * 100)}% under market`, detail: `Booked ${fmt$(w30.adr)}/night vs a ${fmt$(s.pricelabs_avg_next_30)} recommendation at ${Math.round(w30.occupancy * 100)}% occupancy. Next year start base rates higher — high occupancy at a discount is revenue quietly given away.` });
+    }
+  }
+
+  // 4) Booking-window reality: how much of this season booked inside 30 days.
+  const seasonBk = bookings.filter(b => b.check_in >= `${year}-06-01` && b.check_in <= `${year}-10-01` && b.created_at && !(b.notes || '').includes('[import:'));
+  const leads = seasonBk.map(b => Math.round((Date.parse(b.check_in) - Date.parse(b.created_at.slice(0, 10))) / 86400000)).filter(d => d >= 0);
+  if (leads.length >= 10) {
+    const inside30 = leads.filter(d => d <= 30).length;
+    const sharePct = Math.round(inside30 / leads.length * 100);
+    tips.push({ severity: 'good', title: `${sharePct}% of season bookings arrive inside 30 days — plan for it`, detail: `Of ${leads.length} bookings with real booking dates this season, ${inside30} came within a month of check-in. Next year: hold rates until ~3 weeks out, budget for a mid-July "quiet week" without panicking, and save discounts for dates inside 10–14 days.` });
+  }
+
+  // 5) September shoulder: fillable money after Labour Day.
+  const sepStart = `${year}-09-01`, sepEnd = `${year}-10-01`;
+  if (today < sepEnd) {
+    const from = today > sepStart ? today : sepStart;
+    const adrByProp = {}; stats.forEach(s => { adrByProp[s.id] = s.season.adr_achieved || 0; });
+    const pot = computePotentialRevenue(stats.map(s => s.id), from, sepEnd, adrByProp, 2);
+    if (pot.total > 2000) {
+      tips.push({ severity: 'watch', title: `September holds ${fmt$(pot.total)} of open inventory`, detail: `${pot.fillable_nights} fillable nights sit after Labour Day. Fall is the underpriced secret here (warm lake, colours, Hawk Cliff migration) — push a fall campaign in mid-August: past-guest SMS, fall photos on every listing, and 2-night minimums throughout September.` });
+    }
+  }
+
+  // 6) Off-season tenants: which buildings have Oct–Dec income locked in the ROI forecast.
+  const roiNow = computeRoi(year);
+  for (const b of roiNow.buildings) {
+    if (!b.property_ids.length) continue;
+    const post = (b.computed.forecast && b.computed.forecast.post_total) || 0;
+    if (post > 0) {
+      tips.push({ severity: 'good', title: `${b.name}: ${fmt$(post)} of off-season income planned`, detail: `The Oct–Dec tenancy strategy is what lifts this building's annual return — sign next winter's tenants by September 1 so there's zero gap after the STR season, and line up the spring hand-back date before you commit.` });
+    } else if (b.computed.total_income > 0) {
+      tips.push({ severity: 'act', title: `${b.name}: no off-season income planned yet`, detail: `Oct–May sits empty in the plan. Even a winter tenant at modest rent beats heating an empty cottage — decide by September 1 whether this building gets a tenant, monthly furnished stays, or stays open for winter STR.` });
+    }
+  }
+
+  // 7) Direct-booking share — every direct stay skips 3–5% in fees and builds the rebooking list.
+  const m = computeMetrics(year);
+  if (m.direct_booking_pct < 0.15 && seasonBk.length >= 10) {
+    tips.push({ severity: 'watch', title: `Only ${Math.round(m.direct_booking_pct * 100)}% of bookings are direct`, detail: `Every platform stay pays 3–5% in fees. Next year: pre-season email/SMS to the past-guest list (it's ${tableAll('guests').length}+ names strong now), a "book direct" card in each cottage, and repeat-guest pricing. Even 25% direct meaningfully lifts net revenue.` });
+  }
+
+  return tips;
 }
 app.get('/api/insights', (req, res) => ok(res, computeInsights()));
 

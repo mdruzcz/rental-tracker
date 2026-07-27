@@ -3073,6 +3073,22 @@ Matt`;
         root.appendChild(card);
       }
     }
+
+    // Next-season planning: lessons from this season that need action before the next one.
+    if (data.next_season && data.next_season.length) {
+      root.appendChild(el('div', { class: 'between', style: 'margin-top:24px;' },
+        el('h1', { style: 'font-size:20px;' }, 'Planning for next season'),
+        el('span', { class: 'muted', style: 'font-size:12px;' }, 'derived from this season\'s bookings, channels, rates & tenancies')));
+      const card = el('div', { class: 'card' });
+      const order = { act: 0, watch: 1, good: 2 };
+      [...data.next_season].sort((a, b) => (order[a.severity] || 1) - (order[b.severity] || 1)).forEach(t => {
+        const meta = sevMeta[t.severity] || sevMeta.watch;
+        card.appendChild(el('div', { class: 'insight ' + meta.cls },
+          el('div', { class: 'insight-head' }, el('span', { class: 'insight-badge' }, meta.label), el('strong', null, t.title)),
+          el('div', { class: 'insight-detail' }, t.detail)));
+      });
+      root.appendChild(card);
+    }
   };
 
   // ---------- EXPENSES ----------
