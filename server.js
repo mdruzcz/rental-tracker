@@ -2562,6 +2562,597 @@ app.put('/api/roi', (req, res) => {
   ok(res, computeRoi(year));
 });
 
+// ---------- BANK LEDGER (payout routing + inter-account reconciliation) ----------
+// All four doors are paid out by Airbnb/VRBO, but the money belongs in two different bank
+// accounts: Retreat + Hideaway (4488 East Road, the 50/50 building with Kyle) settle to
+// Libro 2644; Escape + Look Out settle to Libro 8315 (STMD Properties Inc.). The platforms
+// sometimes deposit into the wrong one, so every ledger entry records BOTH where the money
+// landed (`actual_account`) and where it belonged (`correct_account`, derived from the
+// property). Each account therefore carries two running balances — actual vs. what it
+// SHOULD be — and the gap between them is exactly the transfer that has to be made.
+// No new tables: entries live in settings key `ledger_entries`, config in `ledger_accounts`
+// and `ledger_listing_map`.
+const LEDGER_ACCOUNT_DEFAULTS = [
+  {
+    key: 'libro-2644', label: 'Libro 2644', bank: 'Libro Credit Union', last4: '2644',
+    entity: 'Kyle Oliveira / 4488 East Road', sub: 'Retreat + Hideaway',
+    nicknames: ['Retreat', 'Hideaway'],
+  },
+  {
+    key: 'libro-8315', label: 'Libro 8315', bank: 'Libro Credit Union', last4: '8315',
+    entity: 'STMD Properties Inc.', sub: 'Escape + Look Out',
+    nicknames: ['Escape', 'Look Out'],
+  },
+];
+// Platform listing titles / addresses → property nickname. Titles differ from nicknames
+// (and "Ravine Retreat" is Look Out, NOT Retreat — never fuzzy-match on nickname substrings).
+const LEDGER_LISTING_SEED = {
+  'hillside retreat': 'Retreat',
+  'hillside hideaway': 'Hideaway',
+  'ravine cottage walk to beach a c sleeps 8': 'Escape',
+  'ravine retreat w private deck walk to beach': 'Look Out',
+};
+const LEDGER_KINDS = ['payout', 'expense', 'transfer', 'adjustment'];
+
+function ledgerNorm(s) {
+  return String(s == null ? '' : s).toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\broad\b/g, 'rd').replace(/\bstreet\b/g, 'st')
+    .replace(/\bavenue\b/g, 'ave').replace(/\bdrive\b/g, 'dr')
+    .replace(/\bunit\b/g, ' ').replace(/\bapt\b/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+function getLedgerAccounts() {
+  const saved = getSetting('ledger_accounts', null) || {};
+  const props = tableAll('properties');
+  return LEDGER_ACCOUNT_DEFAULTS.map(d => {
+    const s = saved[d.key] || {};
+    const nicknames = Array.isArray(s.nicknames) && s.nicknames.length ? s.nicknames : d.nicknames;
+    let property_ids = props
+      .filter(p => nicknames.some(n => ledgerNorm(p.nickname) === ledgerNorm(n)))
+      .map(p => p.id);
+    if (Array.isArray(s.property_ids)) property_ids = s.property_ids.map(Number).filter(Boolean);
+    return {
+      ...d,
+      label: s.label || d.label,
+      entity: s.entity || d.entity,
+      nicknames, property_ids,
+      opening_balance: Number(s.opening_balance) || 0,
+      opening_note: s.opening_note || '',
+    };
+  });
+}
+function ledgerAccountByLast4(last4) {
+  if (!last4) return null;
+  const a = getLedgerAccounts().find(x => x.last4 === String(last4));
+  return a ? a.key : null;
+}
+function getLedgerEntries() {
+  const v = getSetting('ledger_entries', null);
+  return Array.isArray(v) ? v : [];
+}
+function saveLedgerEntries(list) {
+  const existing = store.settings.find(s => s.key === 'ledger_entries');
+  if (existing) tableUpdate('settings', existing.id, { value: list });
+  else tableInsert('settings', { key: 'ledger_entries', value: list });
+}
+function saveLedgerSetting(key, value) {
+  const existing = store.settings.find(s => s.key === key);
+  if (existing) tableUpdate('settings', existing.id, { value });
+  else tableInsert('settings', { key, value });
+}
+function nextLedgerId(list) {
+  return list.reduce((m, e) => Math.max(m, Number(e.id) || 0), 0) + 1;
+}
+
+// Resolve a platform listing title / property address to one of our properties.
+// Order matters: explicit user map → seeded titles → address → exact nickname. Substring
+// nickname matching is deliberately NOT used ("Ravine Retreat" would resolve to Retreat).
+function matchLedgerProperty(label) {
+  const n = ledgerNorm(label);
+  if (!n) return null;
+  const props = tableAll('properties');
+  const byNickname = nick => {
+    const p = props.find(x => ledgerNorm(x.nickname) === ledgerNorm(nick));
+    return p ? p.id : null;
+  };
+  const userMap = getSetting('ledger_listing_map', null) || {};
+  for (const [k, v] of Object.entries(userMap)) {
+    const kn = ledgerNorm(k);
+    if (kn && (n === kn || n.startsWith(kn) || kn.startsWith(n))) {
+      const id = Number(v);
+      if (id && props.some(p => p.id === id)) return id;
+    }
+  }
+  for (const [k, nick] of Object.entries(LEDGER_LISTING_SEED)) {
+    if (n === k || n.startsWith(k) || k.startsWith(n)) {
+      const id = byNickname(nick);
+      if (id) return id;
+    }
+  }
+  for (const p of props) {
+    const pa = ledgerNorm(p.address);
+    if (pa && (n === pa || n.startsWith(pa) || pa.startsWith(n))) return p.id;
+  }
+  for (const p of props) if (ledgerNorm(p.nickname) === n) return p.id;
+  return null;
+}
+
+// ---- CSV parsing (RFC4180-ish: quoted fields, escaped quotes, embedded newlines) ----
+function parseCsvText(text) {
+  const s = String(text || '').replace(/^﻿/, '');
+  const rows = []; let row = []; let field = ''; let quoted = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quoted) {
+      if (c === '"') { if (s[i + 1] === '"') { field += '"'; i++; } else quoted = false; }
+      else field += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+    else if (c !== '\r') field += c;
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows.filter(r => r.some(c => String(c).trim() !== ''));
+}
+const LEDGER_MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+function ledgerDate(raw) {
+  const s = String(raw || '').trim();
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/); // Airbnb exports MM/DD/YYYY
+  if (m) return `${m[3]}-${String(m[1]).padStart(2, '0')}-${String(m[2]).padStart(2, '0')}`;
+  m = s.match(/^([A-Za-z]{3,9})\s+(\d{1,2}),\s*(\d{4})/); // VRBO: "July 28, 2026"
+  if (m) {
+    const mm = LEDGER_MONTHS[m[1].slice(0, 3).toLowerCase()];
+    if (mm) return `${m[3]}-${String(mm).padStart(2, '0')}-${String(m[2]).padStart(2, '0')}`;
+  }
+  return null;
+}
+const ledgerNum = v => {
+  const n = Number(String(v == null ? '' : v).replace(/[$,\s]/g, ''));
+  return Number.isFinite(n) ? n : 0;
+};
+
+// Airbnb "Transaction history" CSV. A Payout row names the destination bank account and is
+// followed by the reservation / adjustment rows that make it up — that's the only place the
+// export ties money to a listing, so we group forward from each payout and split it per
+// property (one payout can span two doors).
+function parseAirbnbTransactions(rows) {
+  const head = rows[0].map(h => String(h).trim().toLowerCase());
+  const ix = n => head.indexOf(n);
+  const iType = ix('type'), iDate = ix('date'), iDetails = ix('details'), iRef = ix('reference code');
+  const iAmount = ix('amount'), iPaid = ix('paid out'), iListing = ix('listing');
+  const iGuest = ix('guest'), iConf = ix('confirmation code'), iStart = ix('start date'), iEnd = ix('end date');
+  const payouts = []; const warnings = []; let cur = null; let orphanRows = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    const type = String(row[iType] || '').trim().toLowerCase();
+    if (type === 'payout') {
+      const details = String(row[iDetails] || '');
+      const m = details.match(/(\d{4})\s*\(/) || details.match(/(\d{4})\s*$/) || details.match(/checking\s*(\d{4})/i);
+      cur = {
+        date: ledgerDate(row[iDate]), reference: String(row[iRef] || '').trim(),
+        amount: ledgerNum(row[iPaid]), last4: m ? m[1] : null, details, parts: [],
+      };
+      payouts.push(cur);
+      continue;
+    }
+    const amt = ledgerNum(row[iAmount]);
+    if (!amt) continue;
+    if (!cur) { orphanRows++; continue; } // pending / not yet paid out
+    cur.parts.push({
+      listing: String(row[iListing] || '').trim(), amount: amt,
+      guest: String(row[iGuest] || '').trim(), confirmation: String(row[iConf] || '').trim(),
+      start: ledgerDate(row[iStart]), end: ledgerDate(row[iEnd]), type,
+    });
+  }
+  if (orphanRows) warnings.push(`${orphanRows} reservation row${orphanRows === 1 ? '' : 's'} came before any payout row (not paid out yet) — skipped.`);
+
+  const entries = [];
+  for (const p of payouts) {
+    if (!p.date || !p.reference) continue;
+    const account = ledgerAccountByLast4(p.last4);
+    if (!account) warnings.push(`Payout ${p.reference} went to an unrecognised account (…${p.last4 || '????'}) — set that account up first.`);
+    const groups = new Map();
+    for (const part of p.parts) {
+      const pid = matchLedgerProperty(part.listing);
+      const key = pid ? 'p' + pid : 'l' + ledgerNorm(part.listing);
+      if (!groups.has(key)) groups.set(key, { property_id: pid, listing: part.listing, amount: 0, parts: [] });
+      const g = groups.get(key);
+      g.amount = +(g.amount + part.amount).toFixed(2);
+      g.parts.push(part);
+    }
+    const attributed = +[...groups.values()].reduce((a, g) => a + g.amount, 0).toFixed(2);
+    if (!groups.size) {
+      entries.push(ledgerImportEntry({
+        platform: 'Airbnb', date: p.date, amount: p.amount, property_id: null, listing: '',
+        actual_account: account, actual_last4: p.last4, reference: p.reference,
+        memo: 'Payout with no matching reservation rows', import_key: `airbnb|${p.reference}|unallocated`,
+      }));
+      continue;
+    }
+    for (const g of groups.values()) {
+      const memo = g.parts.map(x => [x.guest || null, x.confirmation || null, x.start ? `${x.start}→${x.end || ''}` : null]
+        .filter(Boolean).join(' · ')).join(' | ');
+      entries.push(ledgerImportEntry({
+        platform: 'Airbnb', date: p.date, amount: g.amount, property_id: g.property_id, listing: g.listing,
+        actual_account: account, actual_last4: p.last4, reference: p.reference,
+        memo: memo.slice(0, 400),
+        import_key: `airbnb|${p.reference}|${g.property_id ? 'p' + g.property_id : ledgerNorm(g.listing) || 'unknown'}`,
+      }));
+    }
+    const diff = +(p.amount - attributed).toFixed(2);
+    if (Math.abs(diff) >= 0.01) {
+      entries.push(ledgerImportEntry({
+        platform: 'Airbnb', date: p.date, amount: diff, property_id: null, listing: '',
+        actual_account: account, actual_last4: p.last4, reference: p.reference,
+        memo: 'Unallocated remainder of payout', import_key: `airbnb|${p.reference}|remainder`,
+      }));
+    }
+  }
+  return { format: 'airbnb-transactions', entries, warnings };
+}
+
+// VRBO "Deposit report": bank-account section headers, then one row per payout, then the
+// reservation detail rows underneath it. This is the only VRBO export that names the account.
+function parseVrboDeposits(rows) {
+  const entries = []; const warnings = [];
+  let last4 = null, accountName = '', cur = null;
+  const payouts = [];
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    const c0 = String(row[0] || '').trim();
+    const ref = String(row[1] || '').trim();
+    const propId = String(row[5] || '').trim();
+    if (c0 && !ref && !propId) { // account section header, e.g. LIBRO CREDIT UNION LIMITED 8315
+      accountName = c0;
+      const m = c0.match(/(\d{4})\s*$/);
+      last4 = m ? m[1] : null;
+      if (!ledgerAccountByLast4(last4)) warnings.push(`Deposits into an unrecognised account "${c0}" — set that account up first.`);
+      cur = null;
+      continue;
+    }
+    if (ref && !propId) { // payout header
+      cur = { reference: ref, date: ledgerDate(row[2]), total: ledgerNum(row[3]), last4, accountName, parts: [] };
+      payouts.push(cur);
+      continue;
+    }
+    if (propId) {
+      if (!cur) { warnings.push(`Reservation ${String(row[8] || '').trim()} had no payout header above it — skipped.`); continue; }
+      cur.parts.push({
+        listing: String(row[7] || '').trim() || `VRBO property ${propId}`,
+        amount: ledgerNum(row[11]),
+        guest: [String(row[9] || '').trim(), String(row[10] || '').trim()].filter(Boolean).join(' '),
+        confirmation: String(row[8] || '').trim(),
+      });
+    }
+  }
+  for (const p of payouts) {
+    if (!p.date || !p.reference) continue;
+    const account = ledgerAccountByLast4(p.last4);
+    const groups = new Map();
+    for (const part of p.parts) {
+      const pid = matchLedgerProperty(part.listing);
+      const key = pid ? 'p' + pid : 'l' + ledgerNorm(part.listing);
+      if (!groups.has(key)) groups.set(key, { property_id: pid, listing: part.listing, amount: 0, parts: [] });
+      const g = groups.get(key);
+      g.amount = +(g.amount + part.amount).toFixed(2);
+      g.parts.push(part);
+    }
+    if (!groups.size) {
+      entries.push(ledgerImportEntry({
+        platform: 'VRBO', date: p.date, amount: p.total, property_id: null, listing: '',
+        actual_account: account, actual_last4: p.last4, reference: p.reference,
+        memo: 'Payout with no reservation detail rows', import_key: `vrbo|${p.reference}|unallocated`,
+      }));
+      continue;
+    }
+    for (const g of groups.values()) {
+      const memo = g.parts.map(x => [x.guest || null, x.confirmation || null].filter(Boolean).join(' · ')).join(' | ');
+      entries.push(ledgerImportEntry({
+        platform: 'VRBO', date: p.date, amount: g.amount, property_id: g.property_id, listing: g.listing,
+        actual_account: account, actual_last4: p.last4, reference: p.reference,
+        memo: memo.slice(0, 400),
+        import_key: `vrbo|${p.reference}|${g.property_id ? 'p' + g.property_id : ledgerNorm(g.listing) || 'unknown'}`,
+      }));
+    }
+  }
+  return { format: 'vrbo-deposits', entries, warnings };
+}
+
+function ledgerImportEntry(e) {
+  return {
+    kind: 'payout', source: 'import',
+    platform: e.platform, date: e.date, amount: +Number(e.amount || 0).toFixed(2),
+    property_id: e.property_id || null, listing: e.listing || '',
+    actual_account: e.actual_account || null, actual_last4: e.actual_last4 || null,
+    reference: e.reference || '', memo: e.memo || '', import_key: e.import_key,
+  };
+}
+
+function parseLedgerCsv(text) {
+  const rows = parseCsvText(text);
+  if (rows.length < 2) return { error: 'Could not read any rows from that file.' };
+  const head = rows[0].map(h => String(h).trim().toLowerCase());
+  const has = n => head.includes(n);
+  if (has('confirmation code') && has('reference code') && has('paid out')) return parseAirbnbTransactions(rows);
+  if (has('account name') && has('reference number') && has('total payout')) return parseVrboDeposits(rows);
+  if (has('payout date') && has('gross booking amount')) {
+    return { error: 'That is the VRBO Payout Summary — it does not say which bank account each payout landed in. Export the VRBO "Deposit Report" for the same date range and import that instead.' };
+  }
+  return { error: 'Unrecognised file. Supported: the Airbnb transaction history CSV, and the VRBO deposit report CSV.' };
+}
+
+// ---- the ledger itself ----
+function computeLedger() {
+  const accounts = getLedgerAccounts();
+  const props = tableAll('properties');
+  const propName = id => { const p = props.find(x => x.id === Number(id)); return p ? p.nickname : null; };
+  const acctForProp = {};
+  accounts.forEach(a => a.property_ids.forEach(pid => { acctForProp[pid] = a.key; }));
+
+  const entries = getLedgerEntries().map(e => {
+    const correct = e.kind === 'transfer' ? null
+      : (e.correct_account || acctForProp[e.property_id] || e.actual_account || null);
+    return {
+      ...e,
+      property_nickname: propName(e.property_id),
+      correct_account: correct,
+      misrouted: e.kind !== 'transfer' && !!correct && !!e.actual_account && correct !== e.actual_account,
+    };
+  }).sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || (Number(b.id) || 0) - (Number(a.id) || 0));
+
+  const blank = () => ({ deposits: 0, expenses: 0, adjustments: 0, transfers_in: 0, transfers_out: 0, actual: 0, target: 0, misrouted_in: 0, misrouted_out: 0, entry_count: 0 });
+  const sums = {}; accounts.forEach(a => { sums[a.key] = blank(); });
+
+  for (const e of entries) {
+    const amt = Number(e.amount) || 0;
+    if (e.kind === 'transfer') {
+      if (sums[e.from_account]) { sums[e.from_account].transfers_out += amt; sums[e.from_account].actual -= amt; sums[e.from_account].entry_count++; }
+      if (sums[e.to_account]) { sums[e.to_account].transfers_in += amt; sums[e.to_account].actual += amt; sums[e.to_account].entry_count++; }
+      continue;
+    }
+    const signed = e.kind === 'expense' ? -amt : amt;
+    if (sums[e.actual_account]) {
+      const s = sums[e.actual_account];
+      s.actual += signed; s.entry_count++;
+      if (e.kind === 'expense') s.expenses += amt;
+      else if (e.kind === 'adjustment') s.adjustments += amt;
+      else s.deposits += amt;
+    }
+    if (sums[e.correct_account]) sums[e.correct_account].target += signed;
+    if (e.misrouted) {
+      if (sums[e.actual_account]) sums[e.actual_account].misrouted_in += signed;
+      if (sums[e.correct_account]) sums[e.correct_account].misrouted_out += signed;
+    }
+  }
+
+  const round2 = n => +Number(n || 0).toFixed(2);
+  const accountsOut = accounts.map(a => {
+    const s = sums[a.key];
+    const actual_balance = round2(a.opening_balance + s.actual);
+    const target_balance = round2(a.opening_balance + s.target);
+    return {
+      key: a.key, label: a.label, bank: a.bank, last4: a.last4, entity: a.entity, sub: a.sub,
+      opening_balance: round2(a.opening_balance), opening_note: a.opening_note,
+      properties: a.property_ids.map(id => ({ id, nickname: propName(id) })).filter(p => p.nickname),
+      deposits: round2(s.deposits), expenses: round2(s.expenses), adjustments: round2(s.adjustments),
+      transfers_in: round2(s.transfers_in), transfers_out: round2(s.transfers_out),
+      misrouted_in: round2(s.misrouted_in), misrouted_out: round2(s.misrouted_out),
+      entry_count: s.entry_count,
+      actual_balance, target_balance, variance: round2(target_balance - actual_balance),
+    };
+  });
+
+  // Net the variances into the fewest transfers. Positive variance = the account is short.
+  const short = accountsOut.filter(a => a.variance > 0.005).map(a => ({ key: a.key, label: a.label, entity: a.entity, left: a.variance }));
+  const over = accountsOut.filter(a => a.variance < -0.005).map(a => ({ key: a.key, label: a.label, entity: a.entity, left: -a.variance }));
+  const settlement = [];
+  for (const o of over) {
+    for (const w of short) {
+      if (o.left <= 0.005 || w.left <= 0.005) continue;
+      const amount = round2(Math.min(o.left, w.left));
+      settlement.push({ from: o.key, from_label: o.label, from_entity: o.entity, to: w.key, to_label: w.label, to_entity: w.entity, amount });
+      o.left = round2(o.left - amount); w.left = round2(w.left - amount);
+    }
+  }
+
+  const misrouted = entries.filter(e => e.misrouted);
+  const unmapped = [];
+  const seenUnmapped = new Set();
+  for (const e of entries) {
+    if (e.kind === 'transfer' || e.property_id || !e.listing) continue;
+    const k = ledgerNorm(e.listing);
+    if (!k || seenUnmapped.has(k)) continue;
+    seenUnmapped.add(k);
+    unmapped.push({ listing: e.listing, platform: e.platform || '', count: entries.filter(x => ledgerNorm(x.listing) === k).length });
+  }
+  const unknownAccounts = [...new Set(entries
+    .filter(e => e.kind !== 'transfer' && !e.actual_account && e.actual_last4)
+    .map(e => e.actual_last4))];
+
+  const years = [...new Set(entries.map(e => String(e.date || '').slice(0, 4)).filter(Boolean))].sort().reverse();
+  return {
+    accounts: accountsOut, entries, settlement, misrouted, unmapped,
+    unknown_accounts: unknownAccounts, years,
+    properties: props.map(p => ({ id: p.id, nickname: p.nickname, account: acctForProp[p.id] || null })),
+    totals: {
+      out_of_place: round2(misrouted.reduce((a, e) => a + Math.abs(Number(e.amount) || 0), 0)),
+      to_transfer: round2(settlement.reduce((a, t) => a + t.amount, 0)),
+      entries: entries.length,
+    },
+  };
+}
+
+// `?summary=1` drops the entry list — that's all the 30s badge poll needs.
+app.get('/api/ledger', (req, res) => {
+  const data = computeLedger();
+  if (req.query.summary) return ok(res, { accounts: data.accounts, settlement: data.settlement, totals: data.totals });
+  ok(res, data);
+});
+
+app.post('/api/ledger/import', (req, res) => {
+  const body = req.body || {};
+  const parsed = parseLedgerCsv(body.text || '');
+  if (parsed.error) return err(res, 400, parsed.error);
+  const existing = getLedgerEntries();
+  const byKey = new Map(existing.filter(e => e.import_key).map(e => [e.import_key, e]));
+  const added = [], changed = []; let unchanged = 0;
+  for (const e of parsed.entries) {
+    const prev = byKey.get(e.import_key);
+    if (!prev) { added.push(e); continue; }
+    const differs = Math.abs((Number(prev.amount) || 0) - e.amount) >= 0.005
+      || (prev.actual_account || null) !== (e.actual_account || null)
+      || (prev.property_id || null) !== (e.property_id || null);
+    if (differs) changed.push({ ...prev, ...e, id: prev.id }); else unchanged++;
+  }
+  if (body.commit) {
+    let list = existing.slice();
+    let id = nextLedgerId(list);
+    for (const c of changed) list = list.map(x => (Number(x.id) === Number(c.id) ? c : x));
+    for (const a of added) list.push({ ...a, id: id++ });
+    saveLedgerEntries(list);
+  }
+  ok(res, {
+    format: parsed.format, committed: !!body.commit,
+    added: added.length, changed: changed.length, unchanged,
+    warnings: parsed.warnings || [],
+    preview: added.slice(0, 400).concat(changed.slice(0, 100)).map(e => ({
+      date: e.date, platform: e.platform, amount: e.amount, listing: e.listing,
+      property_id: e.property_id, actual_account: e.actual_account, actual_last4: e.actual_last4,
+      reference: e.reference, memo: e.memo,
+    })),
+    unmapped_listings: [...new Set(parsed.entries.filter(e => !e.property_id && e.listing).map(e => e.listing))],
+    ledger: body.commit ? computeLedger() : null,
+  });
+});
+
+app.post('/api/ledger/entries', (req, res) => {
+  const b = req.body || {};
+  const kind = LEDGER_KINDS.includes(b.kind) ? b.kind : 'payout';
+  const date = ledgerDate(b.date);
+  if (!date) return err(res, 400, 'A valid date is required');
+  const amount = +Number(b.amount || 0).toFixed(2);
+  if (!amount) return err(res, 400, 'Amount is required');
+  const accounts = getLedgerAccounts().map(a => a.key);
+  const entry = {
+    kind, source: 'manual', date, amount,
+    platform: b.platform || '', memo: b.memo || '', reference: b.reference || '',
+    property_id: b.property_id ? Number(b.property_id) : null,
+    listing: b.listing || '',
+  };
+  if (kind === 'transfer') {
+    if (!accounts.includes(b.from_account) || !accounts.includes(b.to_account)) return err(res, 400, 'A transfer needs a valid from and to account');
+    if (b.from_account === b.to_account) return err(res, 400, 'Transfer accounts must differ');
+    entry.from_account = b.from_account; entry.to_account = b.to_account;
+  } else {
+    if (!accounts.includes(b.actual_account)) return err(res, 400, 'Pick the account the money actually moved through');
+    entry.actual_account = b.actual_account;
+    if (b.correct_account && accounts.includes(b.correct_account)) entry.correct_account = b.correct_account;
+  }
+  const list = getLedgerEntries();
+  entry.id = nextLedgerId(list);
+  list.push(entry);
+  saveLedgerEntries(list);
+  ok(res, { entry, ledger: computeLedger() });
+});
+
+app.put('/api/ledger/entries/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const list = getLedgerEntries();
+  const idx = list.findIndex(e => Number(e.id) === id);
+  if (idx < 0) return err(res, 404, 'entry not found');
+  const b = req.body || {};
+  const accounts = getLedgerAccounts().map(a => a.key);
+  const patch = { ...list[idx] };
+  if (b.date) { const d = ledgerDate(b.date); if (!d) return err(res, 400, 'Invalid date'); patch.date = d; }
+  if (b.amount !== undefined) patch.amount = +Number(b.amount || 0).toFixed(2);
+  if (b.memo !== undefined) patch.memo = b.memo;
+  if (b.platform !== undefined) patch.platform = b.platform;
+  if (b.reference !== undefined) patch.reference = b.reference;
+  if (b.property_id !== undefined) patch.property_id = b.property_id ? Number(b.property_id) : null;
+  if (b.actual_account !== undefined && accounts.includes(b.actual_account)) patch.actual_account = b.actual_account;
+  if (b.correct_account !== undefined) patch.correct_account = accounts.includes(b.correct_account) ? b.correct_account : null;
+  if (b.from_account !== undefined && accounts.includes(b.from_account)) patch.from_account = b.from_account;
+  if (b.to_account !== undefined && accounts.includes(b.to_account)) patch.to_account = b.to_account;
+  list[idx] = patch;
+  saveLedgerEntries(list);
+  ok(res, { entry: patch, ledger: computeLedger() });
+});
+
+app.delete('/api/ledger/entries/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const list = getLedgerEntries().filter(e => Number(e.id) !== id);
+  saveLedgerEntries(list);
+  ok(res, { ok: true, ledger: computeLedger() });
+});
+
+// Record the reconciling transfer. Doing this moves the ACTUAL balances together without
+// touching the target balances — which is what drives the variance back to zero.
+app.post('/api/ledger/settle', (req, res) => {
+  const b = req.body || {};
+  const accounts = getLedgerAccounts().map(a => a.key);
+  if (!accounts.includes(b.from) || !accounts.includes(b.to) || b.from === b.to) return err(res, 400, 'Pick two different accounts');
+  const amount = +Number(b.amount || 0).toFixed(2);
+  if (amount <= 0) return err(res, 400, 'Transfer amount must be positive');
+  const list = getLedgerEntries();
+  const entry = {
+    id: nextLedgerId(list), kind: 'transfer', source: 'manual',
+    date: ledgerDate(b.date) || new Date().toISOString().slice(0, 10),
+    amount, from_account: b.from, to_account: b.to,
+    memo: b.memo || 'Reconciling transfer between owner accounts',
+    platform: '', reference: b.reference || '', property_id: null, listing: '',
+  };
+  list.push(entry);
+  saveLedgerEntries(list);
+  ok(res, { entry, ledger: computeLedger() });
+});
+
+app.put('/api/ledger/accounts', (req, res) => {
+  const incoming = (req.body || {}).accounts || {};
+  const current = getSetting('ledger_accounts', null) || {};
+  const merged = { ...current };
+  for (const a of LEDGER_ACCOUNT_DEFAULTS) {
+    const inc = incoming[a.key];
+    if (!inc) continue;
+    const next = { ...(current[a.key] || {}) };
+    if (inc.label !== undefined) next.label = String(inc.label || '').slice(0, 80);
+    if (inc.entity !== undefined) next.entity = String(inc.entity || '').slice(0, 120);
+    if (inc.opening_balance !== undefined) next.opening_balance = +Number(inc.opening_balance || 0).toFixed(2);
+    if (inc.opening_note !== undefined) next.opening_note = String(inc.opening_note || '').slice(0, 200);
+    if (Array.isArray(inc.property_ids)) next.property_ids = inc.property_ids.map(Number).filter(Boolean);
+    merged[a.key] = next;
+  }
+  saveLedgerSetting('ledger_accounts', merged);
+  ok(res, computeLedger());
+});
+
+// Teach the importer which property an unrecognised listing title belongs to, then
+// retro-fit every entry that was imported under that title.
+app.put('/api/ledger/listing-map', (req, res) => {
+  const incoming = (req.body || {}).map || {};
+  const current = getSetting('ledger_listing_map', null) || {};
+  const merged = { ...current };
+  const props = tableAll('properties');
+  for (const [label, pid] of Object.entries(incoming)) {
+    const id = Number(pid);
+    const key = ledgerNorm(label);
+    if (!key) continue;
+    if (!id) { delete merged[key]; continue; }
+    if (!props.some(p => p.id === id)) continue;
+    merged[key] = id;
+  }
+  saveLedgerSetting('ledger_listing_map', merged);
+  const list = getLedgerEntries().map(e => {
+    if (e.property_id || !e.listing) return e;
+    const id = merged[ledgerNorm(e.listing)];
+    return id ? { ...e, property_id: id } : e;
+  });
+  saveLedgerEntries(list);
+  ok(res, computeLedger());
+});
+
 // ---------- INSIGHTS ----------
 // Rule-based, data-driven recommendations per property. severity: 'act' | 'watch' | 'good'.
 function computeInsights() {

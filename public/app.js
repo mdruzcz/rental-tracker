@@ -205,6 +205,17 @@
     propertyStats: () => api('GET', '/api/property-stats'),
     insights: () => api('GET', '/api/insights'),
     roi: { get: (year) => api('GET', '/api/roi' + (year ? '?year=' + year : '')), save: (b) => api('PUT', '/api/roi', b) },
+    ledger: {
+      get: () => api('GET', '/api/ledger'),
+      summary: () => api('GET', '/api/ledger?summary=1'),
+      import: (b) => api('POST', '/api/ledger/import', b),
+      createEntry: (b) => api('POST', '/api/ledger/entries', b),
+      updateEntry: (id, b) => api('PUT', `/api/ledger/entries/${id}`, b),
+      removeEntry: (id) => api('DELETE', `/api/ledger/entries/${id}`),
+      settle: (b) => api('POST', '/api/ledger/settle', b),
+      saveAccounts: (b) => api('PUT', '/api/ledger/accounts', b),
+      saveListingMap: (b) => api('PUT', '/api/ledger/listing-map', b),
+    },
     listingMeta: (id, b) => api('PUT', `/api/properties/${id}/listing-meta`, b),
     orphans: () => api('GET', '/api/orphans'),
     messageTemplates: { list: () => api('GET', '/api/message-templates'), update: (id, b) => api('PUT', `/api/message-templates/${id}`, b) },
@@ -285,7 +296,7 @@
 
   // ---------- router ----------
   const VIEWS = {};
-  const TOOL_VIEWS = new Set(['ltr', 'annual', 'roi', 'pricing', 'requests', 'todos', 'guests', 'bulk', 'mailing', 'maintenance', 'cleanerCal', 'licensing', 'smsInbox', 'expenses', 'messaging', 'reviews', 'upsellCatalog', 'settings', 'cleaners']);
+  const TOOL_VIEWS = new Set(['ltr', 'annual', 'roi', 'ledger', 'pricing', 'requests', 'todos', 'guests', 'bulk', 'mailing', 'maintenance', 'cleanerCal', 'licensing', 'smsInbox', 'expenses', 'messaging', 'reviews', 'upsellCatalog', 'settings', 'cleaners']);
   function setView(name) {
     $$('.tab').forEach(b => {
       if (b.classList.contains('tools-toggle')) {
@@ -337,9 +348,10 @@
   // Background: refresh badges so the user sees inbound public bookings + overdue tasks
   async function refreshBadges() {
     try {
-      const [reqs, todos] = await Promise.all([
+      const [reqs, todos, ledger] = await Promise.all([
         API.bookingRequests.list().catch(() => []),
         API.todos.list().catch(() => []),
+        API.ledger.summary().catch(() => null),
       ]);
       const pending = reqs.filter(r => r.status === 'pending').length;
       const reqBadge = $('#requestsBadge');
@@ -352,9 +364,17 @@
       if (overdueOrToday > 0) { todoBadge.textContent = overdueOrToday; todoBadge.classList.remove('hidden'); }
       else todoBadge.classList.add('hidden');
 
+      // Outstanding inter-account transfers — money sitting in the wrong bank account.
+      const owed = (ledger && ledger.settlement) ? ledger.settlement.length : 0;
+      const ledgerBadge = $('#ledgerBadge');
+      if (ledgerBadge) {
+        if (owed > 0) { ledgerBadge.textContent = owed; ledgerBadge.classList.remove('hidden'); }
+        else ledgerBadge.classList.add('hidden');
+      }
+
       // Aggregate badge on the collapsed "More" menu so attention items aren't hidden.
       const moreBadge = $('#moreBadge');
-      const moreTotal = pending + overdueOrToday;
+      const moreTotal = pending + overdueOrToday + owed;
       if (moreBadge) {
         if (moreTotal > 0) { moreBadge.textContent = moreTotal; moreBadge.classList.remove('hidden'); }
         else moreBadge.classList.add('hidden');
@@ -2997,6 +3017,392 @@ Matt`;
   }
   function roiEditLine(label, inputEl) {
     return el('div', { class: 'stat-line roi-edit' }, el('span', null, label), inputEl);
+  }
+
+  // ---------- BANK LEDGER ----------
+  // Two owner accounts, four doors. Every payout records where the money LANDED and where it
+  // BELONGED; the gap between each account's actual and target balance is the transfer owed.
+  const ledgerFilter = { year: '', account: '', property: '', problems: false, q: '' };
+  const fmtC = (n) => new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD' }).format(Number(n) || 0);
+
+  VIEWS.ledger = async (root) => {
+    const data = await API.ledger.get();
+    const acctLabel = (key) => { const a = data.accounts.find(x => x.key === key); return a ? a.label : '—'; };
+
+    root.appendChild(el('div', { class: 'between' },
+      el('h1', null, 'Bank Ledger'),
+      el('div', { class: 'btn-row' },
+        el('button', { class: 'btn-ghost', onclick: () => ledgerEntryForm(data) }, '+ Add entry'),
+        el('button', { class: 'btn-primary', onclick: () => ledgerImportForm(data) }, 'Import payouts'))));
+    root.appendChild(el('div', { class: 'muted', style: 'margin:-8px 0 16px;font-size:13px;max-width:900px;' },
+      'Airbnb and VRBO pay out all four doors, but the money belongs in two different accounts. Every entry records where the deposit ',
+      el('em', null, 'landed'), ' and where it ', el('em', null, 'belonged'),
+      ' (from the property), so each account carries an actual balance and a should-be balance. The gap between them is the transfer to make.'));
+
+    // --- settlement banner ---
+    root.appendChild(ledgerSettlementCard(data));
+
+    // --- account cards ---
+    const grid = el('div', { class: 'ledger-accounts' });
+    data.accounts.forEach(a => grid.appendChild(ledgerAccountCard(a, data)));
+    root.appendChild(grid);
+
+    if (data.unknown_accounts.length) {
+      root.appendChild(el('div', { class: 'card warn-card' },
+        el('strong', null, 'Deposits into an account this ledger does not know about: '),
+        data.unknown_accounts.map(l => '…' + l).join(', '),
+        el('div', { class: 'muted', style: 'font-size:12px;margin-top:4px;' },
+          'Those entries are parked — they are not counted in either balance until the account exists.')));
+    }
+
+    // --- unmapped listings ---
+    if (data.unmapped.length) root.appendChild(ledgerUnmappedCard(data));
+
+    // --- entries ---
+    root.appendChild(ledgerEntriesCard(data, acctLabel));
+  };
+
+  function ledgerSettlementCard(data) {
+    if (!data.settlement.length) {
+      return el('div', { class: 'card ledger-banner ok' },
+        el('div', { class: 'ledger-banner-title' }, '✓ Both accounts reconcile'),
+        el('div', { class: 'muted' }, data.totals.entries
+          ? `All ${data.totals.entries} ledger entries landed in the account they belong to (or the difference has already been transferred).`
+          : 'Nothing in the ledger yet — import an Airbnb or VRBO payout report to get started.'));
+    }
+    const card = el('div', { class: 'card ledger-banner act' });
+    card.appendChild(el('div', { class: 'ledger-banner-title' },
+      `${fmtC(data.totals.to_transfer)} is sitting in the wrong account`));
+    data.settlement.forEach(t => {
+      card.appendChild(el('div', { class: 'ledger-settle-row' },
+        el('div', null,
+          el('strong', { class: 'ledger-settle-amount' }, fmtC(t.amount)),
+          el('span', { class: 'muted' }, '  transfer from  '),
+          el('strong', null, t.from_label), el('span', { class: 'muted' }, ` (${t.from_entity})`),
+          el('span', { class: 'muted' }, '  →  '),
+          el('strong', null, t.to_label), el('span', { class: 'muted' }, ` (${t.to_entity})`)),
+        el('button', { class: 'btn-primary small', onclick: () => ledgerSettleForm(t) }, 'Record this transfer')));
+    });
+    card.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-top:8px;' },
+      'Recording the transfer moves the actual balances together without touching the should-be balances — that is what drives the difference back to zero. Do it after the money actually moves in online banking.'));
+    return card;
+  }
+
+  function ledgerAccountCard(a, data) {
+    const card = el('div', { class: 'card ledger-acct ' + (Math.abs(a.variance) > 0.005 ? 'off' : 'ok') });
+    card.appendChild(el('div', null,
+      el('h2', { style: 'margin-bottom:2px;' }, a.label),
+      el('div', { class: 'muted', style: 'font-size:12px;' },
+        a.entity + (a.properties.length ? ' • ' + a.properties.map(p => p.nickname).join(' + ') : ' • no properties assigned'))));
+
+    card.appendChild(el('div', { class: 'ledger-bal-row' },
+      el('div', { class: 'ledger-bal' },
+        el('div', { class: 'label' }, 'Should be'),
+        el('div', { class: 'value' }, fmtC(a.target_balance))),
+      el('div', { class: 'ledger-bal' },
+        el('div', { class: 'label' }, 'Actually is'),
+        el('div', { class: 'value' }, fmtC(a.actual_balance))),
+      el('div', { class: 'ledger-bal ' + (Math.abs(a.variance) <= 0.005 ? 'good' : a.variance > 0 ? 'short' : 'over') },
+        el('div', { class: 'label' }, Math.abs(a.variance) <= 0.005 ? 'Difference' : a.variance > 0 ? 'Owed to this account' : 'Holding for the other account'),
+        el('div', { class: 'value' }, fmtC(Math.abs(a.variance))))));
+
+    const lines = el('div', { class: 'ledger-lines' });
+    const line = (label, val, cls) => lines.appendChild(el('div', { class: 'stat-line ' + (cls || '') }, el('span', null, label), el('strong', null, fmtC(val))));
+    if (a.opening_balance) line('Opening balance' + (a.opening_note ? ` — ${a.opening_note}` : ''), a.opening_balance);
+    line('Payouts deposited here', a.deposits);
+    if (a.expenses) line('Payments out', -a.expenses);
+    if (a.adjustments) line('Adjustments', a.adjustments);
+    if (a.transfers_in) line('Transfers in', a.transfers_in);
+    if (a.transfers_out) line('Transfers out', -a.transfers_out);
+    line('Actual balance', a.actual_balance, 'roi-total');
+    if (a.misrouted_in) line('… of which belongs to the other account', -a.misrouted_in, 'warn-line');
+    if (a.misrouted_out) line('Its money that landed elsewhere', a.misrouted_out, 'warn-line');
+    line('Should be', a.target_balance, 'roi-grand ' + (Math.abs(a.variance) <= 0.005 ? 'pos' : 'neg'));
+    card.appendChild(lines);
+
+    const openInput = el('input', { type: 'number', step: '0.01', value: a.opening_balance ? String(a.opening_balance) : '', placeholder: '0.00' });
+    openInput.style.width = '120px'; openInput.style.textAlign = 'right';
+    const noteInput = el('input', { type: 'text', value: a.opening_note || '', placeholder: 'e.g. balance at Jan 1 2026' });
+    const saveBtn = el('button', { class: 'btn-ghost small' }, 'Save opening balance');
+    saveBtn.addEventListener('click', async () => {
+      try {
+        await API.ledger.saveAccounts({ accounts: { [a.key]: { opening_balance: Number(openInput.value) || 0, opening_note: noteInput.value } } });
+        toast(a.label + ' updated', 'success'); setView('ledger');
+      } catch (e) {}
+    });
+    card.appendChild(el('div', { class: 'ledger-open-row' },
+      el('span', { class: 'muted' }, 'Opening balance'), openInput, noteInput, saveBtn));
+    card.appendChild(el('div', { class: 'muted', style: 'font-size:11px;margin-top:6px;' },
+      'Set this to the real bank balance on the day the ledger starts if you want these numbers to match your statement. Leave it at 0 to track platform money only.'));
+    return card;
+  }
+
+  function ledgerUnmappedCard(data) {
+    const card = el('div', { class: 'card warn-card' });
+    card.appendChild(el('h3', null, 'Listings not matched to a property'));
+    card.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-bottom:8px;' },
+      'These payouts have no property, so the ledger cannot tell which account they belong in — it assumes they landed correctly. Map them and every matching entry is updated.'));
+    const picks = {};
+    const opts = [{ value: '', label: '— pick a property —' }].concat(data.properties.map(p => ({ value: String(p.id), label: p.nickname })));
+    data.unmapped.forEach(u => {
+      picks[u.listing] = select('m_' + slug(u.listing), opts, '');
+      card.appendChild(el('div', { class: 'ledger-map-row' },
+        el('span', null, u.listing, el('span', { class: 'muted' }, `  (${u.platform || 'ledger'} · ${u.count} entr${u.count === 1 ? 'y' : 'ies'})`)),
+        picks[u.listing]));
+    });
+    const btn = el('button', { class: 'btn-primary small', style: 'margin-top:10px;' }, 'Save mappings');
+    btn.addEventListener('click', async () => {
+      const map = {};
+      for (const [listing, sel] of Object.entries(picks)) if (sel.value) map[listing] = Number(sel.value);
+      if (!Object.keys(map).length) { toast('Nothing to map', 'error'); return; }
+      try { await API.ledger.saveListingMap({ map }); toast('Mapped', 'success'); setView('ledger'); } catch (e) {}
+    });
+    card.appendChild(btn);
+    return card;
+  }
+
+  function ledgerEntriesCard(data, acctLabel) {
+    const card = el('div', { class: 'card' });
+    const yearOpts = [{ value: '', label: 'All years' }].concat(data.years.map(y => ({ value: y, label: y })));
+    const acctOpts = [{ value: '', label: 'All accounts' }].concat(data.accounts.map(a => ({ value: a.key, label: a.label })));
+    const propOpts = [{ value: '', label: 'All properties' }].concat(data.properties.map(p => ({ value: String(p.id), label: p.nickname })));
+    const ySel = select('ly', yearOpts, ledgerFilter.year);
+    const aSel = select('la', acctOpts, ledgerFilter.account);
+    const pSel = select('lp', propOpts, ledgerFilter.property);
+    const q = input('lq', { value: ledgerFilter.q, placeholder: 'Search guest, reference, memo…' });
+    const problems = el('input', { type: 'checkbox' });
+    problems.checked = ledgerFilter.problems;
+    [ySel, aSel, pSel].forEach(s => { s.style.width = 'auto'; });
+    q.style.maxWidth = '260px';
+
+    const body = el('div');
+    const rerender = () => {
+      ledgerFilter.year = ySel.value; ledgerFilter.account = aSel.value;
+      ledgerFilter.property = pSel.value; ledgerFilter.q = q.value; ledgerFilter.problems = problems.checked;
+      body.innerHTML = '';
+      body.appendChild(ledgerTable(filtered(), data, acctLabel));
+    };
+    [ySel, aSel, pSel, problems].forEach(s => s.addEventListener('change', rerender));
+    q.addEventListener('input', rerender);
+
+    function filtered() {
+      const needle = ledgerFilter.q.trim().toLowerCase();
+      return data.entries.filter(e => {
+        if (ledgerFilter.year && String(e.date || '').slice(0, 4) !== ledgerFilter.year) return false;
+        if (ledgerFilter.account && e.actual_account !== ledgerFilter.account && e.correct_account !== ledgerFilter.account
+          && e.from_account !== ledgerFilter.account && e.to_account !== ledgerFilter.account) return false;
+        if (ledgerFilter.property && String(e.property_id || '') !== ledgerFilter.property) return false;
+        if (ledgerFilter.problems && !e.misrouted) return false;
+        if (needle) {
+          const hay = [e.memo, e.reference, e.listing, e.property_nickname, e.platform].join(' ').toLowerCase();
+          if (!hay.includes(needle)) return false;
+        }
+        return true;
+      });
+    }
+
+    card.appendChild(el('div', { class: 'between' },
+      el('h3', null, 'Ledger entries'),
+      el('div', { class: 'btn-row' },
+        el('button', {
+          class: 'btn-ghost small', onclick: () => downloadCsv('bank-ledger.csv',
+            ['Date', 'Platform', 'Kind', 'Property', 'Amount', 'Landed in', 'Should be in', 'Flag', 'Reference', 'Memo'],
+            filtered().map(e => [e.date, e.platform || '', e.kind, e.property_nickname || e.listing || '',
+              e.amount, e.kind === 'transfer' ? acctLabel(e.from_account) + ' → ' + acctLabel(e.to_account) : acctLabel(e.actual_account),
+              e.kind === 'transfer' ? '' : acctLabel(e.correct_account), e.misrouted ? 'WRONG ACCOUNT' : '', e.reference || '', e.memo || '']))
+        }, 'Export CSV'))));
+
+    const filters = el('div', { class: 'ledger-filters' },
+      ySel, aSel, pSel, q,
+      el('label', { class: 'ledger-check' }, problems, el('span', null, 'Wrong account only')));
+    card.appendChild(filters);
+    card.appendChild(body);
+    rerender();
+    return card;
+  }
+
+  function ledgerTable(entries, data, acctLabel) {
+    if (!entries.length) return el('div', { class: 'empty' }, 'No entries match those filters.');
+    const tbl = el('table', { class: 'ledger-table' });
+    tbl.appendChild(el('thead', null, el('tr', null,
+      el('th', null, 'Date'), el('th', null, 'Source'), el('th', null, 'Property'),
+      el('th', { class: 'num' }, 'Amount'), el('th', null, 'Landed in'), el('th', null, 'Should be in'),
+      el('th', null, 'Detail'), el('th', null, ''))));
+    const tb = el('tbody');
+    entries.forEach(e => {
+      const tr = el('tr', { class: e.misrouted ? 'ledger-bad' : null });
+      tr.appendChild(el('td', null, fmtDate(e.date)));
+      tr.appendChild(el('td', null, e.kind === 'transfer' ? el('span', { class: 'tag' }, 'Transfer')
+        : e.kind === 'expense' ? el('span', { class: 'tag' }, 'Payment out')
+        : e.kind === 'adjustment' ? el('span', { class: 'tag' }, 'Adjustment')
+        : (e.platform || 'Manual')));
+      tr.appendChild(el('td', null, e.property_nickname || el('span', { class: 'muted' }, e.listing || '—')));
+      tr.appendChild(el('td', { class: 'num' }, (e.kind === 'expense' ? '−' : '') + fmtC(Math.abs(e.amount))));
+      tr.appendChild(el('td', null, e.kind === 'transfer'
+        ? el('span', { class: 'muted' }, acctLabel(e.from_account) + ' → ' + acctLabel(e.to_account))
+        : acctLabel(e.actual_account)));
+      tr.appendChild(el('td', null, e.kind === 'transfer' ? el('span', { class: 'muted' }, '—')
+        : e.misrouted ? el('strong', { class: 'ledger-should' }, acctLabel(e.correct_account) + ' ⚠')
+        : el('span', { class: 'muted' }, acctLabel(e.correct_account))));
+      tr.appendChild(el('td', { class: 'ledger-memo' }, [e.reference, e.memo].filter(Boolean).join(' · ')));
+      tr.appendChild(el('td', { class: 'row-actions' },
+        el('button', { class: 'icon-btn', title: 'Edit', onclick: () => ledgerEntryForm(data, e) }, '✎'),
+        el('button', { class: 'icon-btn', title: 'Delete', onclick: async () => {
+          if (!confirm('Delete this ledger entry?')) return;
+          try { await API.ledger.removeEntry(e.id); toast('Deleted'); setView('ledger'); } catch (err) {}
+        } }, '×')));
+      tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);
+    const wrap = el('div');
+    wrap.appendChild(tbl);
+    const total = entries.filter(e => e.kind !== 'transfer').reduce((a, e) => a + (e.kind === 'expense' ? -1 : 1) * (Number(e.amount) || 0), 0);
+    wrap.appendChild(el('div', { class: 'muted', style: 'text-align:right;margin-top:8px;font-size:13px;' },
+      `${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} • net ${fmtC(total)} (transfers excluded)`));
+    return wrap;
+  }
+
+  function ledgerSettleForm(t) {
+    const form = el('form');
+    const date = input('date', { type: 'date', value: isoToday() });
+    const amount = input('amount', { type: 'number', step: '0.01', value: t.amount });
+    const memo = input('memo', { value: `Reconciling transfer — ${t.from_label} → ${t.to_label}` });
+    form.appendChild(el('div', { class: 'muted', style: 'margin-bottom:10px;' },
+      `Records a transfer of money out of ${t.from_label} and into ${t.to_label}. Make the transfer in online banking first, then record it here.`));
+    form.appendChild(el('div', { class: 'form-grid' },
+      formField('Date of transfer', date), formField('Amount', amount), formField('Memo', memo, { full: true })));
+    form.appendChild(el('div', { class: 'btn-row', style: 'margin-top:14px;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, 'Record transfer'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      try {
+        await API.ledger.settle({ from: t.from, to: t.to, amount: Number(amount.value), date: date.value, memo: memo.value });
+        closeModal(); toast('Transfer recorded', 'success'); setView('ledger');
+      } catch (e) {}
+    });
+    openModal('Record reconciling transfer', form);
+  }
+
+  function ledgerEntryForm(data, existing) {
+    const e = existing || {};
+    const form = el('form');
+    const kindSel = select('kind', [
+      { value: 'payout', label: 'Money in (payout / deposit)' },
+      { value: 'expense', label: 'Money out (payment from the account)' },
+      { value: 'transfer', label: 'Transfer between the two accounts' },
+      { value: 'adjustment', label: 'Adjustment / correction' },
+    ], e.kind || 'payout');
+    const date = input('date', { type: 'date', value: e.date || isoToday() });
+    const amount = input('amount', { type: 'number', step: '0.01', value: e.amount == null ? '' : Math.abs(e.amount) });
+    const platform = input('platform', { value: e.platform || '', placeholder: 'Airbnb, VRBO, Cottages Canada, Direct…' });
+    const reference = input('reference', { value: e.reference || '', placeholder: 'Payout / cheque reference' });
+    const memo = input('memo', { value: e.memo || '', placeholder: 'Guest, invoice, what this was' });
+    const acctOpts = data.accounts.map(a => ({ value: a.key, label: a.label + ' — ' + a.entity }));
+    const propOpts = [{ value: '', label: '— none / not property specific —' }].concat(data.properties.map(p => ({ value: String(p.id), label: p.nickname })));
+    const property = select('property_id', propOpts, e.property_id ? String(e.property_id) : '');
+    const actual = select('actual_account', acctOpts, e.actual_account || data.accounts[0].key);
+    const correct = select('correct_account', [{ value: '', label: 'Follow the property (recommended)' }].concat(acctOpts), e.correct_account || '');
+    const from = select('from_account', acctOpts, e.from_account || data.accounts[0].key);
+    const to = select('to_account', acctOpts, e.to_account || (data.accounts[1] || data.accounts[0]).key);
+
+    const normalFields = el('div', { class: 'form-grid' },
+      formField('Property', property),
+      formField('Account it actually moved through', actual),
+      formField('Account it belongs to', correct));
+    const transferFields = el('div', { class: 'form-grid' },
+      formField('From account', from), formField('To account', to));
+    const syncKind = () => {
+      const isTransfer = kindSel.value === 'transfer';
+      normalFields.classList.toggle('hidden', isTransfer);
+      transferFields.classList.toggle('hidden', !isTransfer);
+    };
+    kindSel.addEventListener('change', syncKind);
+
+    form.appendChild(el('div', { class: 'form-grid' },
+      formField('Type', kindSel), formField('Date', date), formField('Amount', amount),
+      formField('Source / platform', platform), formField('Reference', reference), formField('Memo', memo, { full: true })));
+    form.appendChild(normalFields);
+    form.appendChild(transferFields);
+    syncKind();
+    form.appendChild(el('div', { class: 'btn-row', style: 'margin-top:14px;' },
+      el('button', { class: 'btn-primary', type: 'submit' }, existing ? 'Save entry' : 'Add entry'),
+      el('button', { class: 'btn-ghost', type: 'button', onclick: closeModal }, 'Cancel')));
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const payload = {
+        kind: kindSel.value, date: date.value, amount: Number(amount.value),
+        platform: platform.value, reference: reference.value, memo: memo.value,
+      };
+      if (kindSel.value === 'transfer') { payload.from_account = from.value; payload.to_account = to.value; }
+      else {
+        payload.property_id = property.value ? Number(property.value) : null;
+        payload.actual_account = actual.value;
+        payload.correct_account = correct.value || null;
+      }
+      try {
+        if (existing) await API.ledger.updateEntry(existing.id, payload);
+        else await API.ledger.createEntry(payload);
+        closeModal(); toast(existing ? 'Entry saved' : 'Entry added', 'success'); setView('ledger');
+      } catch (err) {}
+    });
+    openModal(existing ? 'Edit ledger entry' : 'Add ledger entry', form);
+  }
+
+  function ledgerImportForm(data) {
+    const wrap = el('div');
+    wrap.appendChild(el('div', { class: 'muted', style: 'margin-bottom:10px;' },
+      'Drop in the ', el('strong', null, 'Airbnb transaction history CSV'), ' (Earnings → Transaction history → Export) or the ',
+      el('strong', null, 'VRBO deposit report CSV'), ' (Reservations → Payments → Deposit report). ',
+      'The deposit report is the one that names the bank account — the VRBO payout summary does not. Re-importing the same file is safe: entries are matched on payout reference and updated, never duplicated.'));
+    const file = el('input', { type: 'file', accept: '.csv,text/csv' });
+    const area = textarea('csv', '', { rows: 5, placeholder: '…or paste the CSV contents here' });
+    const result = el('div');
+    let parsedText = '';
+    file.addEventListener('change', () => {
+      const f = file.files[0]; if (!f) return;
+      const rd = new FileReader();
+      rd.onload = () => { parsedText = String(rd.result || ''); area.value = ''; preview(); };
+      rd.readAsText(f);
+    });
+    wrap.appendChild(el('div', { style: 'margin-bottom:8px;' }, file));
+    wrap.appendChild(area);
+    const previewBtn = el('button', { class: 'btn-ghost', type: 'button', onclick: () => { parsedText = area.value || parsedText; preview(); } }, 'Check file');
+    wrap.appendChild(el('div', { class: 'btn-row', style: 'margin-top:10px;' }, previewBtn));
+    wrap.appendChild(result);
+
+    async function preview() {
+      const text = parsedText || area.value;
+      if (!text.trim()) { toast('Pick a file or paste the CSV first', 'error'); return; }
+      result.innerHTML = '';
+      let r;
+      try { r = await API.ledger.import({ text, commit: false }); } catch (e) { return; }
+      const box = el('div', { class: 'card', style: 'margin-top:12px;' });
+      box.appendChild(el('div', null, el('strong', null, r.format === 'airbnb-transactions' ? 'Airbnb transaction history' : 'VRBO deposit report'),
+        ` — ${r.added} new, ${r.changed} changed, ${r.unchanged} already recorded.`));
+      (r.warnings || []).forEach(w => box.appendChild(el('div', { class: 'muted', style: 'font-size:12px;color:var(--warning-ink);' }, '⚠ ' + w)));
+      if (r.unmapped_listings.length) box.appendChild(el('div', { class: 'muted', style: 'font-size:12px;' },
+        'Listings with no matching property (map them after importing): ' + r.unmapped_listings.join(', ')));
+      if (r.preview.length) {
+        const rows = r.preview.slice(0, 12).map(p => [fmtDate(p.date), p.property_id ? (data.properties.find(x => x.id === p.property_id) || {}).nickname : (p.listing || '—'), fmtC(p.amount), '…' + (p.actual_last4 || '????')]);
+        box.appendChild(simpleTable(['Date', 'Property', { label: 'Amount', num: true }, 'Into account'], rows));
+        if (r.preview.length > 12) box.appendChild(el('div', { class: 'muted', style: 'font-size:12px;' }, `…and ${r.preview.length - 12} more.`));
+      }
+      if (r.added || r.changed) {
+        const go = el('button', { class: 'btn-primary', style: 'margin-top:10px;' }, `Import ${r.added + r.changed} entr${r.added + r.changed === 1 ? 'y' : 'ies'}`);
+        go.addEventListener('click', async () => {
+          try {
+            const done = await API.ledger.import({ text, commit: true });
+            closeModal(); toast(`Imported ${done.added + done.changed} entries`, 'success'); setView('ledger');
+          } catch (e) {}
+        });
+        box.appendChild(go);
+      } else {
+        box.appendChild(el('div', { class: 'muted', style: 'margin-top:8px;' }, 'Nothing new in this file.'));
+      }
+      result.appendChild(box);
+    }
+    openModal('Import payout report', wrap);
   }
 
   // ---------- INSIGHTS ----------

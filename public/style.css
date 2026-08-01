@@ -646,3 +646,47 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .roi-fc-months { display: flex; gap: 6px; flex-wrap: wrap; padding: 4px 0 6px; }
 .roi-fc-month { display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 10px; font-weight: 650; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
 .roi-fc-month input { width: 72px; padding: 4px 6px; font-size: 12px; text-align: right; }
+
+/* ---------- bank ledger ---------- */
+.ledger-banner { border-left: 4px solid var(--border-strong); }
+.ledger-banner.ok { border-left-color: var(--success); background: linear-gradient(0deg, var(--success-soft), var(--success-soft)) padding-box; }
+.ledger-banner.act { border-left-color: var(--danger); background: var(--danger-soft); }
+.ledger-banner-title { font-size: 17px; font-weight: 750; margin-bottom: 6px; }
+.ledger-banner.act .ledger-banner-title { color: var(--danger-ink); }
+.ledger-banner.ok .ledger-banner-title { color: var(--success-ink); }
+.ledger-settle-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; padding: 8px 0; border-top: 1px solid var(--border); }
+.ledger-settle-amount { font-size: 18px; font-variant-numeric: tabular-nums; }
+
+.ledger-accounts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.ledger-acct { margin-bottom: 0; border-top: 3px solid var(--success); }
+.ledger-acct.off { border-top-color: var(--warning); }
+.ledger-bal-row { display: flex; gap: 18px; flex-wrap: wrap; margin: 12px 0 10px; }
+.ledger-bal { flex: 1 1 120px; }
+.ledger-bal .label { font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.ledger-bal .value { font-size: 21px; font-weight: 750; font-variant-numeric: tabular-nums; }
+.ledger-bal.good .value { color: var(--success-ink); }
+.ledger-bal.short .value { color: var(--success-ink); }
+.ledger-bal.over .value { color: var(--danger-ink); }
+.ledger-lines .stat-line { padding: 4px 0; border-bottom: 1px dashed var(--border); }
+.ledger-lines .stat-line:last-child { border-bottom: none; }
+.ledger-open-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 12px; }
+.ledger-open-row input[type="text"] { flex: 1 1 160px; min-width: 120px; }
+
+.ledger-filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0 4px; }
+.ledger-filters select, .ledger-filters input { width: auto; }
+.ledger-check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.ledger-check input { width: auto; }
+.ledger-table td { font-size: 13px; }
+.ledger-table tr.ledger-bad { background: var(--danger-soft); }
+.ledger-table .ledger-should { color: var(--danger-ink); }
+.ledger-table .ledger-memo { color: var(--muted); font-size: 12px; max-width: 280px; }
+.ledger-table .row-actions { white-space: nowrap; text-align: right; width: 70px; }
+.ledger-map-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 5px 0; flex-wrap: wrap; }
+.ledger-map-row select { width: auto; }
+.warn-card { background: var(--warning-soft); border-color: var(--warning); }
+.tag { display: inline-block; padding: 1px 7px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+
+@media (max-width: 900px) {
+  .ledger-accounts { grid-template-columns: 1fr; }
+  .ledger-table .ledger-memo { max-width: 140px; }
+}
