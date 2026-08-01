@@ -2592,7 +2592,8 @@ const LEDGER_LISTING_SEED = {
   'ravine cottage walk to beach a c sleeps 8': 'Escape',
   'ravine retreat w private deck walk to beach': 'Look Out',
 };
-const LEDGER_KINDS = ['payout', 'expense', 'transfer', 'adjustment'];
+// 'bank' entries come from a bank-statement import and carry their sign in `amount`.
+const LEDGER_KINDS = ['payout', 'expense', 'transfer', 'adjustment', 'bank'];
 
 function ledgerNorm(s) {
   return String(s == null ? '' : s).toLowerCase()
@@ -2619,6 +2620,12 @@ function getLedgerAccounts() {
       nicknames, property_ids,
       opening_balance: Number(s.opening_balance) || 0,
       opening_note: s.opening_note || '',
+      // Set by a bank-statement import: the balance the statement opens at, the first day it
+      // covers, and its closing balance. Entries dated before `balance_from` are already
+      // baked into `opening_balance`, so they only contribute a misrouting correction.
+      balance_from: s.balance_from || null,
+      bank_balance: s.bank_balance == null ? null : Number(s.bank_balance),
+      bank_balance_date: s.bank_balance_date || null,
     };
   });
 }
@@ -2707,8 +2714,14 @@ function ledgerDate(raw) {
     const mm = LEDGER_MONTHS[m[1].slice(0, 3).toLowerCase()];
     if (mm) return `${m[3]}-${String(mm).padStart(2, '0')}-${String(m[2]).padStart(2, '0')}`;
   }
+  m = s.match(/^(\d{1,2})([A-Za-z]{3})(\d{4})$/); // Libro statement: "31Jul2026"
+  if (m) {
+    const mm = LEDGER_MONTHS[m[2].toLowerCase()];
+    if (mm) return `${m[3]}-${String(mm).padStart(2, '0')}-${String(m[1]).padStart(2, '0')}`;
+  }
   return null;
 }
+const ledgerDayDiff = (a, b) => Math.round((Date.parse(a + 'T00:00:00Z') - Date.parse(b + 'T00:00:00Z')) / 86400000);
 const ledgerNum = v => {
   const n = Number(String(v == null ? '' : v).replace(/[$,\s]/g, ''));
   return Number.isFinite(n) ? n : 0;
@@ -2871,6 +2884,134 @@ function ledgerImportEntry(e) {
   };
 }
 
+// ---- bank statement (Libro export: Date, Description, Amount, Balance) ----
+// The statement is the authority on what actually hit the account. Platform deposits are
+// MATCHED to the payouts already imported (so a bank line inherits the guest + property
+// instead of becoming a duplicate); everything else becomes its own entry so the ledger's
+// running balance is the real bank balance.
+function parseBankStatement(rows) {
+  const head = rows[0].map(h => String(h).trim().toLowerCase());
+  const iDate = head.indexOf('date'), iDesc = head.indexOf('description');
+  const iAmt = head.indexOf('amount'), iBal = head.indexOf('balance');
+  const lines = []; const warnings = [];
+  let skipped = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const date = ledgerDate(rows[r][iDate]);
+    if (!date) { skipped++; continue; }
+    lines.push({
+      date, description: String(rows[r][iDesc] || '').trim().replace(/\s+/g, ' '),
+      amount: +ledgerNum(rows[r][iAmt]).toFixed(2), balance: +ledgerNum(rows[r][iBal]).toFixed(2),
+    });
+  }
+  if (skipped) warnings.push(`${skipped} row${skipped === 1 ? '' : 's'} had no readable date and were skipped.`);
+  // Libro exports newest-first; the Balance column is the balance AFTER each line, so the
+  // order matters for deriving the opening balance. Normalise to newest-first.
+  if (lines.length > 1 && lines[0].date < lines[lines.length - 1].date) lines.reverse();
+  return { format: 'bank-statement', lines, warnings };
+}
+// "e-Transfer - Out Amanda Airbnb Cleaner" is a cleaner being paid, not an Airbnb deposit —
+// a platform payout is an incoming credit that is not an e-transfer.
+function bankPlatform(description) {
+  const d = String(description || '');
+  if (/e-transfer/i.test(d)) return null;
+  if (/airbnb/i.test(d)) return 'Airbnb';
+  if (/vrbo|homeaway|expedia/i.test(d)) return 'VRBO';
+  return null;
+}
+function ledgerCategorize(description, amount) {
+  // Libro appends "including Service Charge of $-1.50" to e-transfers — strip it so the
+  // charge wording doesn't swamp what the payment was actually for.
+  const d = String(description || '').replace(/\s*including service charge of \$?-?[\d.]+/i, '');
+  if (amount > 0 && bankPlatform(d)) return 'Platform payout';
+  if (/mortgage/i.test(d)) return 'Mortgage';
+  if (/taxes|property tax/i.test(d)) return 'Property tax';
+  if (/water/i.test(d)) return 'Water';
+  if (/enbridge|gas/i.test(d)) return 'Natural gas';
+  if (/et power|hydro|electric/i.test(d)) return 'Electricity';
+  if (/insurance|ins\/ass|belair|dunbar/i.test(d)) return 'Insurance';
+  if (/rogers|bell|internet/i.test(d)) return 'Internet & phone';
+  if (/cleaner|cleaning/i.test(d)) return 'Cleaning';
+  if (/central elgin/i.test(d)) return 'Municipal (Central Elgin)';
+  if (/credit interest/i.test(d)) return 'Interest earned';
+  if (/service fee|management fee/i.test(d)) return 'Bank fees';
+  if (/visa|collabria/i.test(d)) return 'Credit card payment';
+  if (/transfer (out|in)/i.test(d)) return 'Internal transfer';
+  if (/eftpos|purchase|hardware/i.test(d)) return 'Supplies & purchases';
+  if (/e-transfer/i.test(d)) return amount < 0 ? 'E-transfer out' : 'E-transfer in';
+  return 'Uncategorised';
+}
+// Group already-imported payouts by payout reference: one bank deposit can cover several
+// ledger rows (a payout spanning two properties, or a stay plus a resolution adjustment).
+function ledgerPayoutGroups(entries, accountKey) {
+  const groups = new Map();
+  for (const e of entries) {
+    if (e.kind !== 'payout' || e.actual_account !== accountKey) continue;
+    const key = (e.platform || '') + '|' + (e.reference || 'id' + e.id);
+    if (!groups.has(key)) groups.set(key, { key, platform: e.platform, reference: e.reference, date: e.date, amount: 0, ids: [], labels: [], memos: [], matched: false });
+    const g = groups.get(key);
+    g.amount = +(g.amount + (Number(e.amount) || 0)).toFixed(2);
+    g.ids.push(e.id);
+    if (e.property_id) g.labels.push(e.property_id);
+    if (e.memo) g.memos.push(e.memo);
+    if (e.bank_key) g.matched = true;
+    if (e.date && (!g.date || e.date < g.date)) g.date = e.date;
+  }
+  return [...groups.values()];
+}
+function matchBankStatement(lines, accountKey, entries) {
+  const groups = ledgerPayoutGroups(entries, accountKey);
+  const knownKeys = new Set(entries.map(e => e.bank_key).filter(Boolean));
+  const used = new Set();
+  const matches = [], newLines = [], duplicates = [];
+  lines.forEach((ln, i) => { ln.seq = i; }); // statement order, 0 = most recent
+  for (const ln of lines) {
+    ln.bank_key = `bank|${accountKey}|${ln.date}|${ln.amount.toFixed(2)}|${ln.balance.toFixed(2)}`;
+    ln.category = ledgerCategorize(ln.description, ln.amount);
+    if (knownKeys.has(ln.bank_key)) { duplicates.push(ln); continue; }
+    const plat = bankPlatform(ln.description);
+    if (plat && ln.amount > 0) {
+      let best = null, bestDelta = 99;
+      for (const g of groups) {
+        if (used.has(g.key) || g.matched) continue;
+        if (Math.abs(g.amount - ln.amount) > 0.005) continue;
+        if (g.platform && g.platform !== plat) continue;
+        const delta = Math.abs(ledgerDayDiff(ln.date, g.date));
+        if (delta <= 10 && delta < bestDelta) { best = g; bestDelta = delta; }
+      }
+      if (best) { used.add(best.key); matches.push({ line: ln, group: best, day_gap: bestDelta }); continue; }
+    }
+    newLines.push(ln);
+  }
+  const statement_to = lines.length ? lines[0].date : null;
+  const statement_from = lines.length ? lines[lines.length - 1].date : null;
+  const last = lines[lines.length - 1];
+  return {
+    matches, newLines, duplicates,
+    statement_from, statement_to,
+    closing_balance: lines.length ? lines[0].balance : 0,
+    opening_balance: last ? +(last.balance - last.amount).toFixed(2) : 0,
+    // Payouts inside the statement window that never showed up in the account — either
+    // still in transit or genuinely missing.
+    unmatched_payouts: groups.filter(g => !used.has(g.key) && !g.matched
+      && g.date >= statement_from && g.date <= statement_to),
+  };
+}
+// A Libro export names no account, so infer it: whichever account's outstanding payouts
+// the platform deposits line up with.
+function detectBankAccount(lines, entries) {
+  let bestKey = null, bestScore = 0;
+  for (const a of getLedgerAccounts()) {
+    const groups = ledgerPayoutGroups(entries, a.key);
+    let score = 0;
+    for (const ln of lines) {
+      if (!bankPlatform(ln.description) || ln.amount <= 0) continue;
+      if (groups.some(g => Math.abs(g.amount - ln.amount) <= 0.005 && Math.abs(ledgerDayDiff(ln.date, g.date)) <= 10)) score++;
+    }
+    if (score > bestScore) { bestScore = score; bestKey = a.key; }
+  }
+  return { account: bestKey, score: bestScore };
+}
+
 function parseLedgerCsv(text) {
   const rows = parseCsvText(text);
   if (rows.length < 2) return { error: 'Could not read any rows from that file.' };
@@ -2878,6 +3019,7 @@ function parseLedgerCsv(text) {
   const has = n => head.includes(n);
   if (has('confirmation code') && has('reference code') && has('paid out')) return parseAirbnbTransactions(rows);
   if (has('account name') && has('reference number') && has('total payout')) return parseVrboDeposits(rows);
+  if (has('date') && has('description') && has('amount') && has('balance')) return parseBankStatement(rows);
   if (has('payout date') && has('gross booking amount')) {
     return { error: 'That is the VRBO Payout Summary — it does not say which bank account each payout landed in. Export the VRBO "Deposit Report" for the same date range and import that instead.' };
   }
@@ -2892,39 +3034,61 @@ function computeLedger() {
   const acctForProp = {};
   accounts.forEach(a => a.property_ids.forEach(pid => { acctForProp[pid] = a.key; }));
 
+  const balanceFrom = {}; accounts.forEach(a => { balanceFrom[a.key] = a.balance_from || null; });
+  // Once a statement has been imported, its opening balance already contains everything that
+  // happened before `balance_from` — so those entries must not be counted again. They still
+  // carry their misrouting correction, because that money is sitting in the opening balance
+  // of the wrong account.
+  const isPre = (acctKey, effDate) => !!(balanceFrom[acctKey] && effDate && effDate < balanceFrom[acctKey]);
+
   const entries = getLedgerEntries().map(e => {
     const correct = e.kind === 'transfer' ? null
       : (e.correct_account || acctForProp[e.property_id] || e.actual_account || null);
+    const eff_date = e.bank_date || e.date;
     return {
-      ...e,
+      ...e, eff_date,
       property_nickname: propName(e.property_id),
       correct_account: correct,
       misrouted: e.kind !== 'transfer' && !!correct && !!e.actual_account && correct !== e.actual_account,
+      pre_statement: e.kind === 'transfer'
+        ? isPre(e.from_account, eff_date) && isPre(e.to_account, eff_date)
+        : isPre(e.actual_account, eff_date),
     };
-  }).sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || (Number(b.id) || 0) - (Number(a.id) || 0));
+  }).sort((a, b) => String(b.eff_date || '').localeCompare(String(a.eff_date || ''))
+    // Same day: keep the bank's own ordering so the running balance column reads correctly.
+    || ((a.bank_seq == null ? 1e9 : a.bank_seq) - (b.bank_seq == null ? 1e9 : b.bank_seq))
+    || (Number(b.id) || 0) - (Number(a.id) || 0));
 
-  const blank = () => ({ deposits: 0, expenses: 0, adjustments: 0, transfers_in: 0, transfers_out: 0, actual: 0, target: 0, misrouted_in: 0, misrouted_out: 0, entry_count: 0 });
+  const blank = () => ({ deposits: 0, expenses: 0, adjustments: 0, transfers_in: 0, transfers_out: 0, actual: 0, target: 0, misrouted_in: 0, misrouted_out: 0, entry_count: 0, in_transit: 0, in_transit_count: 0 });
   const sums = {}; accounts.forEach(a => { sums[a.key] = blank(); });
 
   for (const e of entries) {
     const amt = Number(e.amount) || 0;
     if (e.kind === 'transfer') {
+      if (e.pre_statement) continue;
+      // Deliberately actual-only: a transfer is what CLOSES a variance, so it must not move
+      // the should-be balance with it.
       if (sums[e.from_account]) { sums[e.from_account].transfers_out += amt; sums[e.from_account].actual -= amt; sums[e.from_account].entry_count++; }
       if (sums[e.to_account]) { sums[e.to_account].transfers_in += amt; sums[e.to_account].actual += amt; sums[e.to_account].entry_count++; }
       continue;
     }
     const signed = e.kind === 'expense' ? -amt : amt;
-    if (sums[e.actual_account]) {
-      const s = sums[e.actual_account];
-      s.actual += signed; s.entry_count++;
-      if (e.kind === 'expense') s.expenses += amt;
-      else if (e.kind === 'adjustment') s.adjustments += amt;
-      else s.deposits += amt;
+    // Base contribution — skipped once the money is already inside an imported opening balance.
+    if (!e.pre_statement) {
+      if (sums[e.actual_account]) {
+        const s = sums[e.actual_account];
+        s.actual += signed; s.target += signed; s.entry_count++;
+        if (e.kind === 'expense' || signed < 0) s.expenses += Math.abs(signed);
+        else if (e.kind === 'payout') s.deposits += signed;
+        else s.adjustments += signed;
+        // A payout the platform reported but that has not appeared on the statement yet.
+        if (e.kind === 'payout' && !e.bank_key && balanceFrom[e.actual_account]) { s.in_transit += signed; s.in_transit_count++; }
+      }
     }
-    if (sums[e.correct_account]) sums[e.correct_account].target += signed;
+    // Misrouting correction — always applied, statement window or not.
     if (e.misrouted) {
-      if (sums[e.actual_account]) sums[e.actual_account].misrouted_in += signed;
-      if (sums[e.correct_account]) sums[e.correct_account].misrouted_out += signed;
+      if (sums[e.actual_account]) { sums[e.actual_account].target -= signed; sums[e.actual_account].misrouted_in += signed; }
+      if (sums[e.correct_account]) { sums[e.correct_account].target += signed; sums[e.correct_account].misrouted_out += signed; }
     }
   }
 
@@ -2936,6 +3100,9 @@ function computeLedger() {
     return {
       key: a.key, label: a.label, bank: a.bank, last4: a.last4, entity: a.entity, sub: a.sub,
       opening_balance: round2(a.opening_balance), opening_note: a.opening_note,
+      balance_from: a.balance_from, bank_balance: a.bank_balance, bank_balance_date: a.bank_balance_date,
+      in_transit: round2(s.in_transit), in_transit_count: s.in_transit_count,
+      unexplained: a.bank_balance == null ? null : round2(actual_balance - s.in_transit - a.bank_balance),
       properties: a.property_ids.map(id => ({ id, nickname: propName(id) })).filter(p => p.nickname),
       deposits: round2(s.deposits), expenses: round2(s.expenses), adjustments: round2(s.adjustments),
       transfers_in: round2(s.transfers_in), transfers_out: round2(s.transfers_out),
@@ -2997,6 +3164,7 @@ app.post('/api/ledger/import', (req, res) => {
   const parsed = parseLedgerCsv(body.text || '');
   if (parsed.error) return err(res, 400, parsed.error);
   const existing = getLedgerEntries();
+  if (parsed.format === 'bank-statement') return importBankStatement(req, res, parsed, existing, body);
   const byKey = new Map(existing.filter(e => e.import_key).map(e => [e.import_key, e]));
   const added = [], changed = []; let unchanged = 0;
   for (const e of parsed.entries) {
@@ -3027,6 +3195,74 @@ app.post('/api/ledger/import', (req, res) => {
     ledger: body.commit ? computeLedger() : null,
   });
 });
+
+function importBankStatement(req, res, parsed, existing, body) {
+  const accounts = getLedgerAccounts();
+  const detected = detectBankAccount(parsed.lines, existing);
+  const accountKey = accounts.some(a => a.key === body.account) ? body.account : detected.account;
+  if (!accountKey) return err(res, 400, 'Could not tell which account this statement belongs to — pick one and try again.');
+  const acct = accounts.find(a => a.key === accountKey);
+  const plan = matchBankStatement(parsed.lines, accountKey, existing);
+  const props = tableAll('properties');
+  const propName = id => { const p = props.find(x => x.id === Number(id)); return p ? p.nickname : null; };
+
+  if (body.commit) {
+    const patched = new Map();
+    for (const m of plan.matches) {
+      for (const id of m.group.ids) patched.set(Number(id), { bank_key: m.line.bank_key, bank_date: m.line.date, bank_description: m.line.description, bank_balance: m.line.balance, bank_seq: m.line.seq, category: 'Platform payout' });
+    }
+    // Re-importing the same statement refreshes the statement ordering on rows already there.
+    const seqByKey = new Map(parsed.lines.map(l => [l.bank_key, l.seq]));
+    let list = existing.map(e => {
+      if (patched.has(Number(e.id))) return { ...e, ...patched.get(Number(e.id)) };
+      if (e.bank_key && seqByKey.has(e.bank_key)) return { ...e, bank_seq: seqByKey.get(e.bank_key) };
+      return e;
+    });
+    let id = nextLedgerId(list);
+    for (const ln of plan.newLines) {
+      list.push({
+        id: id++, kind: 'bank', source: 'bank', platform: '',
+        date: ln.date, bank_date: ln.date, amount: ln.amount,
+        bank_description: ln.description, bank_balance: ln.balance, bank_key: ln.bank_key, bank_seq: ln.seq,
+        category: ln.category, memo: ln.description,
+        actual_account: accountKey, property_id: null, listing: '', reference: '',
+      });
+    }
+    saveLedgerEntries(list);
+    saveLedgerSetting('ledger_accounts', {
+      ...(getSetting('ledger_accounts', null) || {}),
+      [accountKey]: {
+        ...((getSetting('ledger_accounts', null) || {})[accountKey] || {}),
+        opening_balance: plan.opening_balance,
+        opening_note: `balance carried into the statement starting ${plan.statement_from}`,
+        balance_from: plan.statement_from,
+        bank_balance: plan.closing_balance,
+        bank_balance_date: plan.statement_to,
+      },
+    });
+  }
+  ok(res, {
+    format: 'bank-statement', committed: !!body.commit,
+    account: accountKey, account_label: acct.label, detected_account: detected.account, detect_score: detected.score,
+    accounts: accounts.map(a => ({ key: a.key, label: a.label, entity: a.entity })),
+    statement_from: plan.statement_from, statement_to: plan.statement_to,
+    opening_balance: plan.opening_balance, closing_balance: plan.closing_balance,
+    matched: plan.matches.length, added: plan.newLines.length, duplicates: plan.duplicates.length,
+    warnings: parsed.warnings || [],
+    matches: plan.matches.slice(0, 500).map(m => ({
+      date: m.line.date, description: m.line.description, amount: m.line.amount,
+      platform: m.group.platform, reference: m.group.reference, payout_date: m.group.date,
+      day_gap: m.day_gap, properties: [...new Set(m.group.labels.map(propName).filter(Boolean))],
+      detail: m.group.memos.join(' | ').slice(0, 200),
+    })),
+    preview: plan.newLines.slice(0, 500).map(l => ({ date: l.date, description: l.description, amount: l.amount, category: l.category })),
+    unmatched_payouts: plan.unmatched_payouts.map(g => ({
+      date: g.date, platform: g.platform, reference: g.reference, amount: g.amount,
+      properties: [...new Set(g.labels.map(propName).filter(Boolean))],
+    })),
+    ledger: body.commit ? computeLedger() : null,
+  });
+}
 
 app.post('/api/ledger/entries', (req, res) => {
   const b = req.body || {};

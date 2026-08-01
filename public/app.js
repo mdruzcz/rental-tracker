@@ -3022,7 +3022,7 @@ Matt`;
   // ---------- BANK LEDGER ----------
   // Two owner accounts, four doors. Every payout records where the money LANDED and where it
   // BELONGED; the gap between each account's actual and target balance is the transfer owed.
-  const ledgerFilter = { year: '', account: '', property: '', problems: false, q: '' };
+  const ledgerFilter = { year: '', account: '', property: '', problems: false, bank: false, q: '' };
   const fmtC = (n) => new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD' }).format(Number(n) || 0);
 
   VIEWS.ledger = async (root) => {
@@ -3106,9 +3106,22 @@ Matt`;
         el('div', { class: 'label' }, Math.abs(a.variance) <= 0.005 ? 'Difference' : a.variance > 0 ? 'Owed to this account' : 'Holding for the other account'),
         el('div', { class: 'value' }, fmtC(Math.abs(a.variance))))));
 
+    if (a.bank_balance != null) {
+      const recon = el('div', { class: 'ledger-recon ' + (Math.abs(a.unexplained || 0) <= 0.01 ? 'ok' : 'off') });
+      recon.appendChild(el('div', null,
+        Math.abs(a.unexplained || 0) <= 0.01 ? '✓ ' : '⚠ ',
+        el('strong', null, 'Libro statement ' + fmtC(a.bank_balance)),
+        el('span', { class: 'muted' }, ' as of ' + fmtDate(a.bank_balance_date))));
+      if (a.in_transit_count) recon.appendChild(el('div', { class: 'muted', style: 'font-size:12px;' },
+        `+ ${fmtC(a.in_transit)} in ${a.in_transit_count} payout${a.in_transit_count === 1 ? '' : 's'} the platform has sent but the bank has not shown yet.`));
+      if (Math.abs(a.unexplained || 0) > 0.01) recon.appendChild(el('div', { class: 'muted', style: 'font-size:12px;color:var(--warning-ink);' },
+        `${fmtC(Math.abs(a.unexplained))} in the ledger is not explained by the statement — import a newer statement, or check for entries added by hand.`));
+      card.appendChild(recon);
+    }
+
     const lines = el('div', { class: 'ledger-lines' });
     const line = (label, val, cls) => lines.appendChild(el('div', { class: 'stat-line ' + (cls || '') }, el('span', null, label), el('strong', null, fmtC(val))));
-    if (a.opening_balance) line('Opening balance' + (a.opening_note ? ` — ${a.opening_note}` : ''), a.opening_balance);
+    if (a.opening_balance) line('Balance carried in' + (a.balance_from ? ` (before ${fmtDate(a.balance_from)})` : ''), a.opening_balance);
     line('Payouts deposited here', a.deposits);
     if (a.expenses) line('Payments out', -a.expenses);
     if (a.adjustments) line('Adjustments', a.adjustments);
@@ -3131,9 +3144,11 @@ Matt`;
       } catch (e) {}
     });
     card.appendChild(el('div', { class: 'ledger-open-row' },
-      el('span', { class: 'muted' }, 'Opening balance'), openInput, noteInput, saveBtn));
+      el('span', { class: 'muted' }, 'Balance carried in'), openInput, noteInput, saveBtn));
     card.appendChild(el('div', { class: 'muted', style: 'font-size:11px;margin-top:6px;' },
-      'Set this to the real bank balance on the day the ledger starts if you want these numbers to match your statement. Leave it at 0 to track platform money only.'));
+      a.balance_from
+        ? `Set automatically from the statement — this is what the account held before ${fmtDate(a.balance_from)}. Anything dated earlier is already inside it, so it is not counted twice (a payout that went to the wrong account still counts against the should-be balance).`
+        : 'Set this to the real bank balance on the day the ledger starts if you want these numbers to match your statement, or just import a bank statement and it fills itself in.'));
     return card;
   }
 
@@ -3172,29 +3187,37 @@ Matt`;
     const q = input('lq', { value: ledgerFilter.q, placeholder: 'Search guest, reference, memo…' });
     const problems = el('input', { type: 'checkbox' });
     problems.checked = ledgerFilter.problems;
+    const bankMode = el('input', { type: 'checkbox' });
+    bankMode.checked = ledgerFilter.bank;
     [ySel, aSel, pSel].forEach(s => { s.style.width = 'auto'; });
     q.style.maxWidth = '260px';
 
     const body = el('div');
     const rerender = () => {
       ledgerFilter.year = ySel.value; ledgerFilter.account = aSel.value;
-      ledgerFilter.property = pSel.value; ledgerFilter.q = q.value; ledgerFilter.problems = problems.checked;
+      ledgerFilter.property = pSel.value; ledgerFilter.q = q.value;
+      ledgerFilter.problems = problems.checked; ledgerFilter.bank = bankMode.checked;
+      // A running bank balance only means anything for one account at a time.
+      if (ledgerFilter.bank && !ledgerFilter.account) { ledgerFilter.account = data.accounts[0].key; aSel.value = ledgerFilter.account; }
       body.innerHTML = '';
-      body.appendChild(ledgerTable(filtered(), data, acctLabel));
+      body.appendChild(ledgerFilter.bank
+        ? ledgerBankTable(filtered(), data, ledgerFilter.account)
+        : ledgerTable(filtered(), data, acctLabel));
     };
-    [ySel, aSel, pSel, problems].forEach(s => s.addEventListener('change', rerender));
+    [ySel, aSel, pSel, problems, bankMode].forEach(s => s.addEventListener('change', rerender));
     q.addEventListener('input', rerender);
 
     function filtered() {
       const needle = ledgerFilter.q.trim().toLowerCase();
       return data.entries.filter(e => {
-        if (ledgerFilter.year && String(e.date || '').slice(0, 4) !== ledgerFilter.year) return false;
+        if (ledgerFilter.bank && (!e.bank_date || e.actual_account !== ledgerFilter.account)) return false;
+        if (ledgerFilter.year && String(e.eff_date || e.date || '').slice(0, 4) !== ledgerFilter.year) return false;
         if (ledgerFilter.account && e.actual_account !== ledgerFilter.account && e.correct_account !== ledgerFilter.account
           && e.from_account !== ledgerFilter.account && e.to_account !== ledgerFilter.account) return false;
         if (ledgerFilter.property && String(e.property_id || '') !== ledgerFilter.property) return false;
         if (ledgerFilter.problems && !e.misrouted) return false;
         if (needle) {
-          const hay = [e.memo, e.reference, e.listing, e.property_nickname, e.platform].join(' ').toLowerCase();
+          const hay = [e.memo, e.reference, e.listing, e.property_nickname, e.platform, e.bank_description, e.category].join(' ').toLowerCase();
           if (!hay.includes(needle)) return false;
         }
         return true;
@@ -3206,19 +3229,55 @@ Matt`;
       el('div', { class: 'btn-row' },
         el('button', {
           class: 'btn-ghost small', onclick: () => downloadCsv('bank-ledger.csv',
-            ['Date', 'Platform', 'Kind', 'Property', 'Amount', 'Landed in', 'Should be in', 'Flag', 'Reference', 'Memo'],
-            filtered().map(e => [e.date, e.platform || '', e.kind, e.property_nickname || e.listing || '',
-              e.amount, e.kind === 'transfer' ? acctLabel(e.from_account) + ' → ' + acctLabel(e.to_account) : acctLabel(e.actual_account),
-              e.kind === 'transfer' ? '' : acctLabel(e.correct_account), e.misrouted ? 'WRONG ACCOUNT' : '', e.reference || '', e.memo || '']))
+            ['Date', 'Bank date', 'Platform', 'Kind', 'Category', 'Property', 'Amount', 'Bank balance', 'Landed in', 'Should be in', 'Flag', 'Reference', 'Detail'],
+            filtered().map(e => [e.date, e.bank_date || '', e.platform || '', e.kind, e.category || '',
+              e.property_nickname || e.listing || '', e.amount, e.bank_balance == null ? '' : e.bank_balance,
+              e.kind === 'transfer' ? acctLabel(e.from_account) + ' → ' + acctLabel(e.to_account) : acctLabel(e.actual_account),
+              e.kind === 'transfer' ? '' : acctLabel(e.correct_account), e.misrouted ? 'WRONG ACCOUNT' : '', e.reference || '',
+              [e.bank_description, e.memo].filter(Boolean).join(' · ')]))
         }, 'Export CSV'))));
 
     const filters = el('div', { class: 'ledger-filters' },
       ySel, aSel, pSel, q,
-      el('label', { class: 'ledger-check' }, problems, el('span', null, 'Wrong account only')));
+      el('label', { class: 'ledger-check' }, problems, el('span', null, 'Wrong account only')),
+      el('label', { class: 'ledger-check' }, bankMode, el('span', null, 'Bank statement view')));
     card.appendChild(filters);
     card.appendChild(body);
     rerender();
     return card;
+  }
+
+  // The bank's own view of one account, with the ledger's detail filled in: every platform
+  // deposit shows which property and guest it was.
+  function ledgerBankTable(entries, data, accountKey) {
+    const acct = data.accounts.find(a => a.key === accountKey) || {};
+    if (!entries.length) return el('div', { class: 'empty' }, 'No bank statement imported for this account yet — use Import payouts and pick your Libro CSV.');
+    const tbl = el('table', { class: 'ledger-table' });
+    tbl.appendChild(el('thead', null, el('tr', null,
+      el('th', null, 'Date'), el('th', null, 'Bank description'), el('th', null, 'Category'),
+      el('th', { class: 'num' }, 'Amount'), el('th', { class: 'num' }, 'Balance'), el('th', null, 'What it was'))));
+    const tb = el('tbody');
+    entries.forEach(e => {
+      const amt = e.kind === 'expense' ? -Math.abs(e.amount) : e.amount;
+      const tr = el('tr', { class: e.misrouted ? 'ledger-bad' : null });
+      tr.appendChild(el('td', null, fmtDate(e.bank_date)));
+      tr.appendChild(el('td', { class: 'ledger-memo' }, e.bank_description || e.memo || '—'));
+      tr.appendChild(el('td', null, el('span', { class: 'tag' }, e.category || '—')));
+      tr.appendChild(el('td', { class: 'num ' + (amt < 0 ? 'neg' : 'pos') }, fmtC(amt)));
+      tr.appendChild(el('td', { class: 'num muted' }, e.bank_balance == null ? '' : fmtC(e.bank_balance)));
+      tr.appendChild(el('td', { class: 'ledger-memo' }, e.property_nickname
+        ? el('span', null, el('strong', null, e.property_nickname), ' · ', e.memo || '',
+            e.misrouted ? el('strong', { class: 'ledger-should' }, '  ⚠ belongs in ' + (data.accounts.find(a => a.key === e.correct_account) || {}).label) : null)
+        : el('span', { class: 'muted' }, '')));
+      tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);
+    const wrap = el('div');
+    wrap.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-bottom:6px;' },
+      `${acct.label} — ${entries.length} transactions on the statement.`
+      + (acct.bank_balance != null ? ` Closing balance ${fmtC(acct.bank_balance)} on ${fmtDate(acct.bank_balance_date)}.` : '')));
+    wrap.appendChild(tbl);
+    return wrap;
   }
 
   function ledgerTable(entries, data, acctLabel) {
@@ -3230,21 +3289,25 @@ Matt`;
       el('th', null, 'Detail'), el('th', null, ''))));
     const tb = el('tbody');
     entries.forEach(e => {
-      const tr = el('tr', { class: e.misrouted ? 'ledger-bad' : null });
-      tr.appendChild(el('td', null, fmtDate(e.date)));
+      const tr = el('tr', { class: (e.misrouted ? 'ledger-bad' : '') + (e.pre_statement ? ' ledger-pre' : '') });
+      tr.appendChild(el('td', null, fmtDate(e.eff_date || e.date),
+        e.pre_statement ? el('div', { class: 'muted', style: 'font-size:10px;' }, 'in opening balance') : null));
       tr.appendChild(el('td', null, e.kind === 'transfer' ? el('span', { class: 'tag' }, 'Transfer')
+        : e.kind === 'bank' ? el('span', { class: 'tag' }, e.category || 'Bank')
         : e.kind === 'expense' ? el('span', { class: 'tag' }, 'Payment out')
         : e.kind === 'adjustment' ? el('span', { class: 'tag' }, 'Adjustment')
-        : (e.platform || 'Manual')));
+        : (e.platform || 'Manual'),
+        e.kind === 'payout' && e.bank_date ? el('span', { class: 'ledger-tick', title: 'Seen on the bank statement ' + fmtDate(e.bank_date) }, ' ✓') : null));
       tr.appendChild(el('td', null, e.property_nickname || el('span', { class: 'muted' }, e.listing || '—')));
-      tr.appendChild(el('td', { class: 'num' }, (e.kind === 'expense' ? '−' : '') + fmtC(Math.abs(e.amount))));
+      tr.appendChild(el('td', { class: 'num' }, (e.kind === 'expense' ? '−' : '') + fmtC(e.kind === 'bank' ? e.amount : Math.abs(e.amount))));
       tr.appendChild(el('td', null, e.kind === 'transfer'
         ? el('span', { class: 'muted' }, acctLabel(e.from_account) + ' → ' + acctLabel(e.to_account))
         : acctLabel(e.actual_account)));
       tr.appendChild(el('td', null, e.kind === 'transfer' ? el('span', { class: 'muted' }, '—')
         : e.misrouted ? el('strong', { class: 'ledger-should' }, acctLabel(e.correct_account) + ' ⚠')
         : el('span', { class: 'muted' }, acctLabel(e.correct_account))));
-      tr.appendChild(el('td', { class: 'ledger-memo' }, [e.reference, e.memo].filter(Boolean).join(' · ')));
+      tr.appendChild(el('td', { class: 'ledger-memo' }, [e.bank_description, e.reference, e.memo].filter(Boolean)
+        .filter((v, i, arr) => arr.indexOf(v) === i).join(' · ')));
       tr.appendChild(el('td', { class: 'row-actions' },
         el('button', { class: 'icon-btn', title: 'Edit', onclick: () => ledgerEntryForm(data, e) }, '✎'),
         el('button', { class: 'icon-btn', title: 'Delete', onclick: async () => {
@@ -3352,22 +3415,23 @@ Matt`;
   function ledgerImportForm(data) {
     const wrap = el('div');
     wrap.appendChild(el('div', { class: 'muted', style: 'margin-bottom:10px;' },
-      'Drop in the ', el('strong', null, 'Airbnb transaction history CSV'), ' (Earnings → Transaction history → Export) or the ',
-      el('strong', null, 'VRBO deposit report CSV'), ' (Reservations → Payments → Deposit report). ',
-      'The deposit report is the one that names the bank account — the VRBO payout summary does not. Re-importing the same file is safe: entries are matched on payout reference and updated, never duplicated.'));
+      'Three files work here: the ', el('strong', null, 'Airbnb transaction history CSV'), ' (Earnings → Transaction history → Export), the ',
+      el('strong', null, 'VRBO deposit report CSV'), ' (Reservations → Payments → Deposit report), and a ',
+      el('strong', null, 'Libro bank statement CSV'), '. The bank statement is matched against payouts already imported, so each deposit picks up its guest and property instead of becoming a duplicate. Re-importing the same file is always safe.'));
     const file = el('input', { type: 'file', accept: '.csv,text/csv' });
     const area = textarea('csv', '', { rows: 5, placeholder: '…or paste the CSV contents here' });
     const result = el('div');
     let parsedText = '';
+    let accountOverride = '';
     file.addEventListener('change', () => {
       const f = file.files[0]; if (!f) return;
       const rd = new FileReader();
-      rd.onload = () => { parsedText = String(rd.result || ''); area.value = ''; preview(); };
+      rd.onload = () => { parsedText = String(rd.result || ''); area.value = ''; accountOverride = ''; preview(); };
       rd.readAsText(f);
     });
     wrap.appendChild(el('div', { style: 'margin-bottom:8px;' }, file));
     wrap.appendChild(area);
-    const previewBtn = el('button', { class: 'btn-ghost', type: 'button', onclick: () => { parsedText = area.value || parsedText; preview(); } }, 'Check file');
+    const previewBtn = el('button', { class: 'btn-ghost', type: 'button', onclick: () => { parsedText = area.value || parsedText; accountOverride = ''; preview(); } }, 'Check file');
     wrap.appendChild(el('div', { class: 'btn-row', style: 'margin-top:10px;' }, previewBtn));
     wrap.appendChild(result);
 
@@ -3376,7 +3440,8 @@ Matt`;
       if (!text.trim()) { toast('Pick a file or paste the CSV first', 'error'); return; }
       result.innerHTML = '';
       let r;
-      try { r = await API.ledger.import({ text, commit: false }); } catch (e) { return; }
+      try { r = await API.ledger.import({ text, commit: false, account: accountOverride || undefined }); } catch (e) { return; }
+      if (r.format === 'bank-statement') { result.appendChild(bankPreviewBox(r, text)); return; }
       const box = el('div', { class: 'card', style: 'margin-top:12px;' });
       box.appendChild(el('div', null, el('strong', null, r.format === 'airbnb-transactions' ? 'Airbnb transaction history' : 'VRBO deposit report'),
         ` — ${r.added} new, ${r.changed} changed, ${r.unchanged} already recorded.`));
@@ -3402,7 +3467,54 @@ Matt`;
       }
       result.appendChild(box);
     }
-    openModal('Import payout report', wrap);
+
+    function bankPreviewBox(r, text) {
+      const box = el('div', { class: 'card', style: 'margin-top:12px;' });
+      const acctSel = select('bankAcct', r.accounts.map(a => ({ value: a.key, label: a.label + ' — ' + a.entity })), r.account);
+      acctSel.style.width = 'auto';
+      acctSel.addEventListener('change', () => { accountOverride = acctSel.value; preview(); });
+      box.appendChild(el('div', { class: 'between' },
+        el('strong', null, 'Libro bank statement'),
+        el('div', { style: 'display:flex;gap:8px;align-items:center;' }, el('span', { class: 'muted' }, 'Account'), acctSel)));
+      box.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin:4px 0 10px;' },
+        `${fmtDate(r.statement_from)} → ${fmtDate(r.statement_to)} · opens at ${fmtC(r.opening_balance)}, closes at ${fmtC(r.closing_balance)}`,
+        r.detect_score ? ` · account picked automatically (${r.detect_score} deposits line up)` : ' · could not auto-detect — confirm the account above'));
+      (r.warnings || []).forEach(w => box.appendChild(el('div', { class: 'muted', style: 'font-size:12px;color:var(--warning-ink);' }, '⚠ ' + w)));
+
+      box.appendChild(el('div', { class: 'stat-line' }, el('span', null, 'Platform deposits matched to payouts already imported'), el('strong', null, String(r.matched))));
+      box.appendChild(el('div', { class: 'stat-line' }, el('span', null, 'Other transactions to add (mortgage, utilities, cleaners…)'), el('strong', null, String(r.added))));
+      if (r.duplicates) box.appendChild(el('div', { class: 'stat-line' }, el('span', null, 'Already in the ledger from an earlier import'), el('strong', null, String(r.duplicates))));
+
+      if (r.matches.length) {
+        box.appendChild(el('h3', { style: 'margin-top:12px;' }, 'Matched deposits'));
+        box.appendChild(simpleTable(['Bank date', 'Deposit', { label: 'Amount', num: true }, 'Now shows as'],
+          r.matches.slice(0, 10).map(m => [fmtDate(m.date), m.platform + (m.day_gap ? ` (paid out ${m.day_gap}d earlier)` : ''), fmtC(m.amount),
+            (m.properties.join(' + ') || '—') + (m.detail ? ' · ' + m.detail.split('·')[0].trim() : '')])));
+        if (r.matches.length > 10) box.appendChild(el('div', { class: 'muted', style: 'font-size:12px;' }, `…and ${r.matches.length - 10} more.`));
+      }
+      if (r.unmatched_payouts.length) {
+        box.appendChild(el('div', { class: 'card warn-card', style: 'margin-top:12px;' },
+          el('strong', null, `${r.unmatched_payouts.length} payout${r.unmatched_payouts.length === 1 ? '' : 's'} in this window never reached the account`),
+          el('div', { class: 'muted', style: 'font-size:12px;margin:4px 0 6px;' }, 'Usually still in transit — the platform pays out a few days before the money lands. Worth chasing if the date has passed.'),
+          simpleTable(['Payout date', 'Platform', 'Property', { label: 'Amount', num: true }],
+            r.unmatched_payouts.map(u => [fmtDate(u.date), u.platform, u.properties.join(' + ') || '—', fmtC(u.amount)]))));
+      }
+      if (r.matched || r.added || r.duplicates) {
+        const go = el('button', { class: 'btn-primary', style: 'margin-top:12px;' },
+          (r.matched || r.added) ? `Import into ${r.account_label}` : `Re-sync ${r.account_label} from this statement`);
+        go.addEventListener('click', async () => {
+          try {
+            const done = await API.ledger.import({ text, commit: true, account: acctSel.value });
+            closeModal(); toast(`${done.matched} matched, ${done.added} added to ${done.account_label}`, 'success'); setView('ledger');
+          } catch (e) {}
+        });
+        box.appendChild(go);
+      } else {
+        box.appendChild(el('div', { class: 'muted', style: 'margin-top:8px;' }, 'This statement is already fully recorded.'));
+      }
+      return box;
+    }
+    openModal('Import payouts or a bank statement', wrap);
   }
 
   // ---------- INSIGHTS ----------

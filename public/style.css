@@ -690,3 +690,11 @@ input[type="checkbox"] { accent-color: var(--accent); }
   .ledger-accounts { grid-template-columns: 1fr; }
   .ledger-table .ledger-memo { max-width: 140px; }
 }
+
+/* bank statement view */
+.ledger-recon { margin: 10px 0 6px; padding: 8px 10px; border-radius: var(--radius-sm); background: var(--success-soft); font-size: 13px; }
+.ledger-recon.off { background: var(--warning-soft); }
+.ledger-table tr.ledger-pre td { opacity: .62; }
+.ledger-table td.num.neg { color: var(--danger-ink); }
+.ledger-table td.num.muted { color: var(--muted); }
+.ledger-tick { color: var(--success-ink); font-weight: 700; }
