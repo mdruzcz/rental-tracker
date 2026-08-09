@@ -119,10 +119,18 @@ const NUMERIC = {
   price_cache: ['recommended_price', 'user_price'],
   properties: ['ltr_rent'], ltr_applicants: ['annual_income', 'credit_score'],
 };
-async function loadSnapshot() {
-  const snap = { next_id: {} };
-  await Promise.all(TABLE_KEYS.map(async (k) => {
-    const { data, error } = await supabase.from(tbl(k)).select('*').order('id', { ascending: true });
+// Egress control. Loading all 21 tables for a request that reads two was the single
+// largest source of Supabase egress in this project, so hot routes declare what they
+// actually touch (see ROUTE_TABLES) and everything else still gets the full snapshot.
+// `ledger_entries` is deliberately excluded from the settings load — it is by far the
+// biggest row in the database and only /api/ledger* needs it (see loadLedgerBlob).
+async function loadSnapshot(keys) {
+  const want = Array.isArray(keys) ? keys : TABLE_KEYS;
+  const snap = { next_id: {}, _loaded: new Set(want) };
+  await Promise.all(want.map(async (k) => {
+    let q = supabase.from(tbl(k)).select('*').order('id', { ascending: true });
+    if (k === 'settings') q = q.neq('key', LEDGER_BLOB_KEY);
+    const { data, error } = await q;
     if (error) throw new Error(`load ${k}: ${error.message}`);
     const rows = data || [];
     (NUMERIC[k] || []).forEach(f => rows.forEach(r => { if (r[f] != null) r[f] = Number(r[f]); }));
@@ -131,10 +139,40 @@ async function loadSnapshot() {
   }));
   return snap;
 }
+const LEDGER_BLOB_KEY = 'ledger_entries';
+
+// Tables each hot route reads. Anything not listed here keeps loading everything, so a
+// missing entry is a performance miss, never a correctness one. Sets are deliberately
+// generous — an over-declared table costs a little egress, an under-declared one throws.
+const ROUTE_TABLES = [
+  [/^\/public\/auth-config$/, []],
+  // buildCalendarEvents() assembles every calendar layer (including the task layers) before
+  // buildPropertyIcs filters down to stays and blocks, so the feed needs all of them.
+  [/^\/public\/ical\//, ['properties', 'bookings', 'synced_events', 'manual_blocks', 'booking_types', 'guests', 'booking_upsells', 'todos', 'cleaner_tasks', 'cleaners']],
+  [/^\/badges$/, ['booking_requests', 'todos', 'settings']],
+  [/^\/ledger/, ['properties', 'settings']],
+];
+// price_cache is ~230 KB — half the database — and only the pricing and projection routes
+// read it, so it is left out of the default set and opted into below.
+const HEAVY_TABLES = ['price_cache'];
+const DEFAULT_TABLES = TABLE_KEYS.filter(k => !HEAVY_TABLES.includes(k));
+const HEAVY_ROUTES = [/^\/dashboard$/, /^\/roi$/, /^\/property-stats$/, /^\/insights$/, /^\/pricing$/, /^\/pricelabs\//, /^\/quote$/, /^\/annual-prediction$/, /^\/cron\//];
+function tablesForPath(p) {
+  for (const [re, tables] of ROUTE_TABLES) if (re.test(p)) return tables;
+  return HEAVY_ROUTES.some(re => re.test(p)) ? TABLE_KEYS : DEFAULT_TABLES;
+}
 
 // `store` proxies to the active request's snapshot so all existing `store.x` code works unchanged.
 const store = new Proxy({}, {
-  get(_, k) { const c = ctx(); return c ? c.store[k] : undefined; },
+  get(_, k) {
+    const c = ctx(); if (!c) return undefined;
+    // Fail loudly rather than returning an empty table. A silently-empty `bookings` would
+    // publish an all-vacant iCal feed to Airbnb and invite double bookings.
+    if (typeof k === 'string' && c.store._loaded && TABLE_KEYS.includes(k) && !c.store._loaded.has(k)) {
+      throw new Error(`table "${k}" is not loaded on this route — add it to ROUTE_TABLES`);
+    }
+    return c.store[k];
+  },
   set(_, k, v) { const c = ctx(); if (c) c.store[k] = v; return true; },
 });
 
@@ -363,7 +401,7 @@ async function requireAuth(req, res, next) {
 app.use('/api', async (req, res, next) => {
   if (req.path === '/public/auth-config') return next(); // no data needed
   let snap;
-  try { snap = await loadSnapshot(); }
+  try { snap = await loadSnapshot(tablesForPath(req.path)); }
   catch (e) { return res.status(500).json({ error: 'data load failed: ' + e.message }); }
   const c = { store: snap, pending: [] };
   const origJson = res.json.bind(res);
@@ -1466,6 +1504,18 @@ function bookingNightsInMonth(booking, year, monthIdx) {
   if (b <= a) return 0;
   return Math.round((b - a) / 86400000);
 }
+
+// One cheap call for the nav badges. Replaces three full-snapshot polls (booking-requests
+// + todos + ledger) with a single request over three small tables.
+app.get('/api/badges', (req, res) => {
+  const today = new Date().toISOString().slice(0, 10);
+  const summary = getSetting('ledger_summary', null) || {};
+  ok(res, {
+    requests: tableAll('booking_requests').filter(r => r.status === 'pending').length,
+    todos: tableAll('todos').filter(t => t.status === 'open' && t.due_date && t.due_date <= today).length,
+    ledger: Number(summary.settlements) || 0,
+  });
+});
 
 app.get('/api/dashboard', (req, res) => {
   const now = new Date();
@@ -2634,14 +2684,49 @@ function ledgerAccountByLast4(last4) {
   const a = getLedgerAccounts().find(x => x.last4 === String(last4));
   return a ? a.key : null;
 }
+// The ledger blob is one large settings row (hundreds of entries) that no other route
+// needs, so it is kept out of the per-request snapshot and fetched only here.
+async function loadLedgerBlob() {
+  const c = ctx();
+  if (!c || c.ledgerLoaded) return;
+  const { data, error } = await supabase.from(tbl('settings')).select('id,key,value').eq('key', LEDGER_BLOB_KEY).maybeSingle();
+  if (error) throw new Error('load ledger: ' + error.message);
+  c.ledgerRow = data || null;
+  c.ledgerLoaded = true;
+}
+function ledgerCtx() {
+  const c = ctx();
+  if (!c || !c.ledgerLoaded) throw new Error('ledger entries were not loaded for this route');
+  return c;
+}
 function getLedgerEntries() {
-  const v = getSetting('ledger_entries', null);
-  return Array.isArray(v) ? v : [];
+  const c = ledgerCtx();
+  return Array.isArray(c.ledgerRow && c.ledgerRow.value) ? c.ledgerRow.value : [];
 }
 function saveLedgerEntries(list) {
-  const existing = store.settings.find(s => s.key === 'ledger_entries');
-  if (existing) tableUpdate('settings', existing.id, { value: list });
-  else tableInsert('settings', { key: 'ledger_entries', value: list });
+  const c = ledgerCtx();
+  if (c.ledgerRow && c.ledgerRow.id) {
+    const id = c.ledgerRow.id;
+    c.ledgerRow.value = list;
+    enqueueWrite(async () => {
+      const { error } = await supabase.from(tbl('settings')).update({ value: list }).eq('id', id);
+      if (error) throw error;
+    }, 'update ledger_entries');
+  } else {
+    c.ledgerRow = { value: list };
+    enqueueWrite(async () => {
+      const { error } = await supabase.from(tbl('settings')).insert({ key: LEDGER_BLOB_KEY, value: list });
+      if (error) throw error;
+    }, 'insert ledger_entries');
+  }
+  // Tiny derived row so the badge poll never has to touch the blob.
+  saveLedgerSetting('ledger_summary', ledgerSummaryOf(list));
+}
+function ledgerSummaryOf(list) {
+  try {
+    const l = computeLedgerFrom(list);
+    return { to_transfer: l.totals.to_transfer, settlements: l.settlement.length, entries: list.length };
+  } catch (e) { return { to_transfer: 0, settlements: 0, entries: list.length }; }
 }
 function saveLedgerSetting(key, value) {
   const existing = store.settings.find(s => s.key === key);
@@ -3027,7 +3112,8 @@ function parseLedgerCsv(text) {
 }
 
 // ---- the ledger itself ----
-function computeLedger() {
+function computeLedger() { return computeLedgerFrom(getLedgerEntries()); }
+function computeLedgerFrom(rawEntries) {
   const accounts = getLedgerAccounts();
   const props = tableAll('properties');
   const propName = id => { const p = props.find(x => x.id === Number(id)); return p ? p.nickname : null; };
@@ -3041,7 +3127,7 @@ function computeLedger() {
   // of the wrong account.
   const isPre = (acctKey, effDate) => !!(balanceFrom[acctKey] && effDate && effDate < balanceFrom[acctKey]);
 
-  const entries = getLedgerEntries().map(e => {
+  const entries = (rawEntries || []).map(e => {
     const correct = e.kind === 'transfer' ? null
       : (e.correct_account || acctForProp[e.property_id] || e.actual_account || null);
     const eff_date = e.bank_date || e.date;
@@ -3152,9 +3238,20 @@ function computeLedger() {
   };
 }
 
-// `?summary=1` drops the entry list — that's all the 30s badge poll needs.
+// Every /api/ledger* route needs the blob; nothing else does.
+app.use('/api/ledger', async (req, res, next) => {
+  try { await loadLedgerBlob(); next(); }
+  catch (e) { err(res, 500, e.message); }
+});
+
 app.get('/api/ledger', (req, res) => {
   const data = computeLedger();
+  // Keep the badge's cached summary honest without it ever reading the blob.
+  const fresh = { to_transfer: data.totals.to_transfer, settlements: data.settlement.length, entries: data.entries.length };
+  const cached = getSetting('ledger_summary', null);
+  if (!cached || cached.to_transfer !== fresh.to_transfer || cached.settlements !== fresh.settlements || cached.entries !== fresh.entries) {
+    saveLedgerSetting('ledger_summary', fresh);
+  }
   if (req.query.summary) return ok(res, { accounts: data.accounts, settlement: data.settlement, totals: data.totals });
   ok(res, data);
 });

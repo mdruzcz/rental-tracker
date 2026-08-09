@@ -202,12 +202,12 @@
     },
     bookingTypeUpdate: (id, b) => api('PUT', `/api/booking-types/${id}`, b),
     financials: (year, propertyId) => api('GET', '/api/financials?' + new URLSearchParams({ ...(year ? { year } : {}), ...(propertyId ? { property_id: propertyId } : {}) })),
+    badges: () => api('GET', '/api/badges'),
     propertyStats: () => api('GET', '/api/property-stats'),
     insights: () => api('GET', '/api/insights'),
     roi: { get: (year) => api('GET', '/api/roi' + (year ? '?year=' + year : '')), save: (b) => api('PUT', '/api/roi', b) },
     ledger: {
       get: () => api('GET', '/api/ledger'),
-      summary: () => api('GET', '/api/ledger?summary=1'),
       import: (b) => api('POST', '/api/ledger/import', b),
       createEntry: (b) => api('POST', '/api/ledger/entries', b),
       updateEntry: (id, b) => api('PUT', `/api/ledger/entries/${id}`, b),
@@ -346,41 +346,29 @@
   });
 
   // Background: refresh badges so the user sees inbound public bookings + overdue tasks
+  // One small request, and only while the tab is actually in front. This used to be three
+  // full-database reads every 30 seconds per open tab, which was most of the app's
+  // Supabase egress bill.
   async function refreshBadges() {
+    if (document.visibilityState === 'hidden') return;
     try {
-      const [reqs, todos, ledger] = await Promise.all([
-        API.bookingRequests.list().catch(() => []),
-        API.todos.list().catch(() => []),
-        API.ledger.summary().catch(() => null),
-      ]);
-      const pending = reqs.filter(r => r.status === 'pending').length;
-      const reqBadge = $('#requestsBadge');
-      if (pending > 0) { reqBadge.textContent = pending; reqBadge.classList.remove('hidden'); }
-      else reqBadge.classList.add('hidden');
-
-      const today = isoToday();
-      const overdueOrToday = todos.filter(t => t.status === 'open' && t.due_date && t.due_date <= today).length;
-      const todoBadge = $('#todosBadge');
-      if (overdueOrToday > 0) { todoBadge.textContent = overdueOrToday; todoBadge.classList.remove('hidden'); }
-      else todoBadge.classList.add('hidden');
-
-      // Outstanding inter-account transfers — money sitting in the wrong bank account.
-      const owed = (ledger && ledger.settlement) ? ledger.settlement.length : 0;
-      const ledgerBadge = $('#ledgerBadge');
-      if (ledgerBadge) {
-        if (owed > 0) { ledgerBadge.textContent = owed; ledgerBadge.classList.remove('hidden'); }
-        else ledgerBadge.classList.add('hidden');
-      }
-
+      const b = await API.badges();
+      const setBadge = (sel, n) => {
+        const node = $(sel); if (!node) return;
+        if (n > 0) { node.textContent = n; node.classList.remove('hidden'); }
+        else node.classList.add('hidden');
+      };
+      setBadge('#requestsBadge', b.requests);
+      setBadge('#todosBadge', b.todos);
+      setBadge('#ledgerBadge', b.ledger);
       // Aggregate badge on the collapsed "More" menu so attention items aren't hidden.
-      const moreBadge = $('#moreBadge');
-      const moreTotal = pending + overdueOrToday + owed;
-      if (moreBadge) {
-        if (moreTotal > 0) { moreBadge.textContent = moreTotal; moreBadge.classList.remove('hidden'); }
-        else moreBadge.classList.add('hidden');
-      }
+      setBadge('#moreBadge', b.requests + b.todos + b.ledger);
     } catch (e) {}
   }
+  // Catch up as soon as the tab comes back rather than polling in the background.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') refreshBadges();
+  });
   // refreshBadges + interval are started by startApp() after a successful login.
 
   function showPotentialBreakdown(pr) {
@@ -4169,7 +4157,7 @@ Matt`;
   let appStarted = false;
   async function startApp() {
     const bar = document.querySelector('.topbar'); if (bar) bar.style.display = '';
-    if (!appStarted) { appStarted = true; ensureLogoutButton(); refreshBadges(); setInterval(refreshBadges, 30000); }
+    if (!appStarted) { appStarted = true; ensureLogoutButton(); refreshBadges(); setInterval(refreshBadges, 5 * 60 * 1000); }
     const ue = $('#userEmail'); if (ue && Auth.session) ue.textContent = Auth.session.email;
     setView('dashboard');
   }
