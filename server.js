@@ -1524,15 +1524,17 @@ app.get('/api/dashboard', (req, res) => {
   const yearEnd = `${year}-12-31`;
   const todayIso = now.toISOString().slice(0, 10);
 
-  const allBookings = tableAll('bookings').map(joinBooking);
+  // Cancelled stays are not income — this used to be the one place in the app that counted
+  // them, which is why Look Out read ~$3.8k higher here than on the ROI tab.
+  const allBookings = tableAll('bookings').map(joinBooking).filter(isLiveBooking);
   const ytdBookings = allBookings.filter(b => b.check_in >= yearStart && b.check_in <= yearEnd);
-  const ytdEarnings = ytdBookings.reduce((a, b) => a + (b.amount || 0), 0);
-  const allTimeEarnings = allBookings.reduce((a, b) => a + (b.amount || 0), 0);
+  const ytdEarnings = sumNet(ytdBookings);
+  const allTimeEarnings = sumNet(allBookings);
 
   const types = tableAll('booking_types');
   const byType = types.map(t => {
     const list = ytdBookings.filter(b => b.booking_type_id === t.id);
-    return { type: t.name, bookings: list.length, earnings: list.reduce((a, b) => a + (b.amount || 0), 0) };
+    return { type: t.name, bookings: list.length, earnings: sumNet(list) };
   }).sort((a, b) => b.earnings - a.earnings);
 
   const elapsedDays = daysBetween(yearStart, todayIso);
@@ -1542,7 +1544,7 @@ app.get('/api/dashboard', (req, res) => {
   const seasonNights = Math.max(1, Math.round((new Date(seasonEnd) - new Date(seasonStart)) / 86400000));
   const byProperty = tableAll('properties').map(p => {
     const list = ytdBookings.filter(b => b.property_id === p.id);
-    const earnings = list.reduce((a, b) => a + (b.amount || 0), 0);
+    const earnings = sumNet(list);
     let nights = 0;
     list.forEach(b => { nights += nightsInWindow(b.check_in, b.check_out, seasonStart, seasonEnd); });
     const occupancy = +(nights / seasonNights).toFixed(3);
@@ -2059,6 +2061,26 @@ app.put('/api/booking-types/:id', (req, res) => {
 });
 
 // ---------- FINANCIALS / NET PROFIT ----------
+// ---------- ONE DEFINITION OF INCOME ----------
+// Every revenue figure in the app — Dashboard, Money, ROI, Insights, forecasts — resolves
+// through these three helpers, so the same stay can never be worth one amount on one tab
+// and another amount on the next. Rules: a cancelled stay is never income, upsells always
+// are, and "net" is what actually reaches the bank after the platform's cut.
+const isLiveBooking = b => !!b && b.status !== 'cancelled';
+const bookingGross = b => +(((b.amount || 0) + (b.upsell_total || 0))).toFixed(2);
+const bookingNet = b => +(bookingGross(b) - (b.platform_fee || 0)).toFixed(2);
+function liveBookings(opts) {
+  const o = opts || {};
+  let list = tableAll('bookings').map(joinBooking).filter(isLiveBooking);
+  if (o.year) {
+    const s = `${o.year}-01-01`, e = `${o.year}-12-31`;
+    list = list.filter(b => b.check_in >= s && b.check_in <= e);
+  }
+  if (o.propertyId) list = list.filter(b => b.property_id === Number(o.propertyId));
+  return list;
+}
+const sumNet = list => +list.reduce((a, b) => a + bookingNet(b), 0).toFixed(2);
+
 function computeFinancials(year, propertyId) {
   const yStart = `${year}-01-01`, yEnd = `${year}-12-31`;
   const pid = propertyId ? Number(propertyId) : null;
@@ -2444,8 +2466,7 @@ function computeRoi(year) {
   const inputs = getRoiInputs(year);
   const yStart = `${year}-01-01`, yEnd = `${year}-12-31`;
   const today = new Date().toISOString().slice(0, 10);
-  const bookings = tableAll('bookings').map(joinBooking)
-    .filter(b => b.status !== 'cancelled' && b.check_in >= yStart && b.check_in <= yEnd);
+  const bookings = liveBookings({ year });
   const expenses = tableAll('expenses').filter(e => (e.date || '') >= yStart && (e.date || '') <= yEnd);
   const props = tableAll('properties');
   const num = v => Number(v) || 0;
@@ -2465,9 +2486,9 @@ function computeRoi(year) {
     const inp = inputs[b.key] || {};
     const propIds = props.filter(p => b.nicknames.some(n => (p.nickname || '').toLowerCase() === n.toLowerCase())).map(p => p.id);
     const bs = bookings.filter(x => propIds.includes(x.property_id));
-    const str_gross = +bs.reduce((a, x) => a + (x.amount || 0) + (x.upsell_total || 0), 0).toFixed(2);
+    const str_gross = +bs.reduce((a, x) => a + bookingGross(x), 0).toFixed(2);
     const platform_fees = +bs.reduce((a, x) => a + (x.platform_fee || 0), 0).toFixed(2);
-    const str_net = +(str_gross - platform_fees).toFixed(2);
+    const str_net = sumNet(bs);
     const tracked_costs = +expenses.filter(e => propIds.includes(e.property_id)).reduce((a, e) => a + (e.amount || 0), 0).toFixed(2);
 
     // Ownership period: annual cost inputs and rate-based interest are prorated to the
@@ -2478,8 +2499,8 @@ function computeRoi(year) {
     const ownedFraction = Math.min(1, ownedDays / daysInYear);
 
     // Seasonal income segments (net of platform fees, by check-in date).
-    const netOf = x => (x.amount || 0) + (x.upsell_total || 0) - (x.platform_fee || 0);
-    const seg = (from, to) => +bs.filter(x => x.check_in >= from && x.check_in < to).reduce((a, x) => a + netOf(x), 0).toFixed(2);
+    const netOf = bookingNet;
+    const seg = (from, to) => (from >= to ? 0 : sumNet(bs.filter(x => x.check_in >= from && x.check_in < to)));
     const segments = {
       pre: { label: `Before season (Jan 1 – ${seasonStart.slice(5)})`, revenue: seg(yStart, seasonStart) },
       season: { label: `Airbnb season (${seasonStart.slice(5)} – ${seasonEnd.slice(5)})`, revenue: seg(seasonStart, seasonEnd) },
@@ -2516,35 +2537,62 @@ function computeRoi(year) {
     const mortgage_interest = +(override > 0 ? override : debt * rate / 100 * ownedFraction).toFixed(2);
     const cash_flow = +(noi - mortgage_interest).toFixed(2);
 
-    // Trending / forecast: season books out its 3+ night gaps, and each off-season MONTH
-    // hits your forecast (per-month, whichever is higher — already-booked or forecast).
-    // Off-season months are editable individually so long-term tenant rent (e.g. 4488's
-    // Jan–May tenants) can be entered month by month. Legacy single-figure fields are
-    // honoured when no monthly forecast has been saved.
+    // ---- YEAR-END INCOME MODEL ----
+    // One question: how does this building finish the year? Three blocks that add up.
+    //   Before season  — one row per month, type the rent you expect (a winter tenant).
+    //   Airbnb season  — whatever the season has actually booked. Never typed, never
+    //                    guessed: it is the same number the Dashboard and Money tabs show.
+    //   After season   — same as before season, for Oct–Dec.
+    // An off-season month uses YOUR number the moment you type one, otherwise it falls
+    // back to what is booked. No max(), no separate "trending" column to reconcile.
     const seasonStartMonth = Number(seasonStart.slice(5, 7));
     const seasonEndMonth = Number(seasonEnd.slice(5, 7));
     const preMonthNums = []; for (let m = 1; m < seasonStartMonth; m++) preMonthNums.push(m);
     const postMonthNums = []; for (let m = seasonEndMonth; m <= 12; m++) postMonthNums.push(m);
-    const fmRaw = (inp.forecast_monthly && typeof inp.forecast_monthly === 'object') ? inp.forecast_monthly : null;
+    const fmRaw = (inp.forecast_monthly && typeof inp.forecast_monthly === 'object') ? inp.forecast_monthly : {};
     const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    const fcMonth = m => fmRaw ? num(fmRaw[m]) : null;
-    const monthRow = m => ({ month: m, label: MONTH_LABELS[m - 1], actual: monthly_total[m - 1], forecast: fcMonth(m) ?? 0, used: Math.max(monthly_total[m - 1], fcMonth(m) ?? 0) });
-    let pre_months = preMonthNums.map(monthRow);
-    let post_months = postMonthNums.map(monthRow);
-    // Legacy fallback: an old single pre/post figure spreads over its window for trending.
-    if (!fmRaw && num(inp.forecast_preseason_income)) {
-      const used = Math.max(num(inp.forecast_preseason_income), segments.pre.revenue);
-      pre_months = pre_months.map(r => ({ ...r, forecast: null }));
-      pre_months._legacyTotal = used;
-    }
-    if (!fmRaw && num(inp.forecast_offseason_income)) {
-      const used = Math.max(num(inp.forecast_offseason_income), segments.post.revenue);
-      post_months = post_months.map(r => ({ ...r, forecast: null }));
-      post_months._legacyTotal = used;
-    }
-    const fcPre = pre_months._legacyTotal != null ? pre_months._legacyTotal : +pre_months.reduce((a, r) => a + r.used, 0).toFixed(2);
-    const fcPost = post_months._legacyTotal != null ? post_months._legacyTotal : +post_months.reduce((a, r) => a + r.used, 0).toFixed(2);
-    const trending_income = +(fcPre + segments.season.revenue + potential_remaining_season + fcPost + other_income).toFixed(2);
+    // Blank means "not entered" and falls back to booked; a typed 0 means "expect nothing".
+    const manualFor = (m) => {
+      const v = fmRaw[m] !== undefined ? fmRaw[m] : fmRaw[String(m)];
+      if (v === undefined || v === null || v === '') return null;
+      return Number(v) || 0;
+    };
+    // Booked revenue for a month, clamped to the off-season window so pre + season + post
+    // always reconciles to the full year even when the season starts mid-month.
+    const monthBooked = (m, winFrom, winTo) => {
+      const mStart = `${year}-${String(m).padStart(2, '0')}-01`;
+      const mEnd = m === 12 ? `${year + 1}-01-01` : `${year}-${String(m + 1).padStart(2, '0')}-01`;
+      return seg(mStart > winFrom ? mStart : winFrom, mEnd < winTo ? mEnd : winTo);
+    };
+    const offRow = (m, winFrom, winTo) => {
+      const booked = monthBooked(m, winFrom, winTo);
+      const manual = manualFor(m);
+      return {
+        month: m, label: MONTH_LABELS[m - 1], booked, manual,
+        used: manual == null ? booked : manual,
+        source: manual == null ? 'booked' : 'manual',
+      };
+    };
+    const pre_months = preMonthNums.map(m => offRow(m, yStart, seasonStart));
+    const post_months = postMonthNums.map(m => offRow(m, seasonEnd, addDays(yEnd, 1)));
+    const totalUsed = rows => +rows.reduce((a, r) => a + r.used, 0).toFixed(2);
+    const pre_total = totalUsed(pre_months);
+    const post_total = totalUsed(post_months);
+    const season_booked = segments.season.revenue;
+
+    const income = {
+      pre: { label: `Before season (Jan–${MONTH_LABELS[Math.max(0, seasonStartMonth - 2)]})`, months: pre_months, total: pre_total },
+      season: { label: `Airbnb season (${seasonStart.slice(5)} – ${seasonEnd.slice(5)})`, booked: season_booked, remaining_potential: potential_remaining_season },
+      post: { label: `After season (${MONTH_LABELS[seasonEndMonth - 1]}–Dec)`, months: post_months, total: post_total },
+      other_income,
+    };
+    income.year_total = +(pre_total + season_booked + post_total + other_income).toFixed(2);
+    income.year_total_if_gaps_fill = +(income.year_total + potential_remaining_season).toFixed(2);
+
+    const year_noi = +(income.year_total - total_opex).toFixed(2);
+    const year_cash_flow = +(year_noi - mortgage_interest).toFixed(2);
+    // Same numbers again, assuming the remaining 3+ night season gaps also sell.
+    const trending_income = income.year_total_if_gaps_fill;
     const trending_noi = +(trending_income - total_opex).toFixed(2);
     const trending_cash_flow = +(trending_noi - mortgage_interest).toFixed(2);
 
@@ -2559,21 +2607,20 @@ function computeRoi(year) {
         str_gross, platform_fees, str_net, tracked_costs, other_income,
         segments, by_property, monthly_total,
         potential_remaining_season,
+        income, year_noi, year_cash_flow,
+        your_year_cash_flow: +(year_cash_flow * (num(inp.ownership_pct) > 0 ? num(inp.ownership_pct) / 100 : 1)).toFixed(2),
         total_income, input_opex, total_opex, noi,
         mortgage_interest, interest_source: override > 0 ? 'actual (override)' : 'balance × rate' + (ownedFraction < 1 ? ' × owned period' : ''),
         cash_flow, equity,
         ownership_period: { from: ownedFrom, to: ownedTo, days: ownedDays, fraction: +ownedFraction.toFixed(3) },
+        year_cash_on_cash: cashBase > 0 ? +(year_cash_flow / cashBase).toFixed(4) : null,
         trending: {
           income: trending_income, noi: trending_noi, cash_flow: trending_cash_flow,
           cash_on_cash: cashBase > 0 ? +(trending_cash_flow / cashBase).toFixed(4) : null,
-          preseason_used: +fcPre.toFixed(2), postseason_used: +fcPost.toFixed(2),
+          preseason_used: pre_total, postseason_used: post_total,
         },
-        forecast: {
-          pre_months: pre_months.map(r => ({ month: r.month, label: r.label, actual: r.actual, forecast: r.forecast, used: r.used })),
-          post_months: post_months.map(r => ({ month: r.month, label: r.label, actual: r.actual, forecast: r.forecast, used: r.used })),
-          pre_total: +fcPre.toFixed(2), post_total: +fcPost.toFixed(2),
-          legacy_mode: !fmRaw && !!(num(inp.forecast_preseason_income) || num(inp.forecast_offseason_income)),
-        },
+        // Kept for the Insights tab, which reads post_total to judge off-season planning.
+        forecast: { pre_months, post_months, pre_total, post_total },
         cap_rate: value > 0 ? +(noi / value).toFixed(4) : null,
         cash_on_cash: cashBase > 0 ? +(cash_flow / cashBase).toFixed(4) : null,
         cash_basis: num(inp.cash_invested) > 0 ? 'cash invested' : 'equity (value − debt)',
@@ -2583,13 +2630,20 @@ function computeRoi(year) {
       },
     };
   });
+  const sumOf = fn => +buildings.reduce((a, b) => a + fn(b.computed), 0).toFixed(2);
   const totals = {
-    cash_flow: +buildings.reduce((a, b) => a + b.computed.cash_flow, 0).toFixed(2),
-    your_cash_flow: +buildings.reduce((a, b) => a + b.computed.your_cash_flow, 0).toFixed(2),
-    noi: +buildings.reduce((a, b) => a + b.computed.noi, 0).toFixed(2),
-    total_income: +buildings.reduce((a, b) => a + b.computed.total_income, 0).toFixed(2),
-    trending_cash_flow: +buildings.reduce((a, b) => a + b.computed.trending.cash_flow, 0).toFixed(2),
-    your_trending_cash_flow: +buildings.reduce((a, b) => a + b.computed.your_trending_cash_flow, 0).toFixed(2),
+    cash_flow: sumOf(c => c.cash_flow),
+    your_cash_flow: sumOf(c => c.your_cash_flow),
+    noi: sumOf(c => c.noi),
+    total_income: sumOf(c => c.total_income),
+    year_income: sumOf(c => c.income.year_total),
+    year_cash_flow: sumOf(c => c.year_cash_flow),
+    your_year_cash_flow: sumOf(c => c.your_year_cash_flow),
+    season_booked: sumOf(c => c.income.season.booked),
+    pre_total: sumOf(c => c.income.pre.total),
+    post_total: sumOf(c => c.income.post.total),
+    trending_cash_flow: sumOf(c => c.trending.cash_flow),
+    your_trending_cash_flow: sumOf(c => c.your_trending_cash_flow),
   };
   return { year, season: { start: seasonStart, end: seasonEnd }, expense_items: ROI_EXPENSE_ITEMS.map(([key, label]) => ({ key, label })), buildings, totals };
 }
@@ -2605,7 +2659,17 @@ app.put('/api/roi', (req, res) => {
   const current = getSetting(key, null) || {};
   const merged = { ...current };
   for (const bld of ROI_BUILDINGS) {
-    if (incoming[bld.key]) merged[bld.key] = { ...(current[bld.key] || {}), ...incoming[bld.key] };
+    if (!incoming[bld.key]) continue;
+    const patch = { ...incoming[bld.key] };
+    // A blank month must stay blank (fall back to booked), not collapse to a typed zero.
+    if (patch.forecast_monthly && typeof patch.forecast_monthly === 'object') {
+      const fm = {};
+      for (const [m, v] of Object.entries(patch.forecast_monthly)) {
+        fm[m] = (v === null || v === undefined || v === '') ? null : (Number(v) || 0);
+      }
+      patch.forecast_monthly = fm;
+    }
+    merged[bld.key] = { ...(current[bld.key] || {}), ...patch };
   }
   const existing = store.settings.find(s => s.key === key);
   if (existing) tableUpdate('settings', existing.id, { value: merged }); else tableInsert('settings', { key, value: merged });

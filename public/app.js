@@ -2821,118 +2821,129 @@ Matt`;
 
   // ---------- ANNUAL ROI / CASH-ON-CASH P&L ----------
   let roiYear = new Date().getFullYear();
+  let roiProp = ''; // '' = all properties
   VIEWS.roi = async (root) => {
-    const data = await API.roi.get(roiYear);
+    const [data, props] = await Promise.all([API.roi.get(roiYear), API.properties.list()]);
     const yearSel = select('ry', (() => { const o = []; const cy = new Date().getFullYear(); for (let y = cy + 1; y >= cy - 3; y--) o.push({ value: String(y), label: String(y) }); return o; })(), String(roiYear));
-    yearSel.style.width = 'auto';
+    const propSel = select('rp', [{ value: '', label: 'All properties' }].concat(props.map(p => ({ value: String(p.id), label: p.nickname }))), roiProp);
+    yearSel.style.width = 'auto'; propSel.style.width = 'auto';
     yearSel.addEventListener('change', () => { roiYear = Number(yearSel.value); setView('roi'); });
+    propSel.addEventListener('change', () => { roiProp = propSel.value; setView('roi'); });
+
     root.appendChild(el('div', { class: 'between' },
       el('h1', null, `Annual ROI — ${data.year}`),
-      el('div', { style: 'display:flex;gap:8px;align-items:center;' }, el('span', { class: 'muted' }, 'Year'), yearSel)));
-    root.appendChild(el('div', { class: 'muted', style: 'margin:-8px 0 16px;font-size:13px;' },
-      'One P&L per building (Retreat + Hideaway share 4488 East Road). STR revenue and tracked expenses flow in automatically from bookings; enter the annual costs below and Save to update the return numbers.'));
+      el('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;' },
+        el('span', { class: 'muted' }, 'Property'), propSel,
+        el('span', { class: 'muted' }, 'Year'), yearSel)));
+
+    // A P&L is per building because the mortgage, taxes and utilities are per building.
+    // Picking a property shows the building it belongs to.
+    const shown = roiProp
+      ? data.buildings.filter(b => b.property_ids.includes(Number(roiProp)))
+      : data.buildings;
+    const selectedProp = props.find(p => String(p.id) === roiProp);
+
+    root.appendChild(el('div', { class: 'muted', style: 'margin:-8px 0 16px;font-size:13px;max-width:900px;' },
+      'Your Airbnb season income comes straight from the bookings — the same number the Dashboard and Money tabs show. ',
+      'Fill in the months before and after the season with the rent you expect, and the year-end total below answers ',
+      el('strong', null, `how ${data.year} finishes.`)));
+
+    const t = data.totals;
+    const scope = shown.length === data.buildings.length ? null : shown;
+    const sum = fn => scope ? +scope.reduce((a, b) => a + fn(b.computed), 0).toFixed(2) : null;
+    const kIncome = scope ? sum(c => c.income.year_total) : t.year_income;
+    const kSeason = scope ? sum(c => c.income.season.booked) : t.season_booked;
+    const kOff = scope ? sum(c => c.income.pre.total + c.income.post.total) : +(t.pre_total + t.post_total).toFixed(2);
+    const kCash = scope ? sum(c => c.year_cash_flow) : t.year_cash_flow;
+    const kYours = scope ? sum(c => c.your_year_cash_flow) : t.your_year_cash_flow;
 
     root.appendChild(el('div', { class: 'kpi-grid' },
-      kpi('Cash flow (booked)', fmtMoney(data.totals.cash_flow), 'all buildings, income on the books', data.totals.cash_flow >= 0 ? 'success' : 'danger'),
-      kpi('Trending cash flow', fmtMoney(data.totals.trending_cash_flow), 'if season gaps fill + off-season forecast', data.totals.trending_cash_flow >= 0 ? 'success' : 'danger'),
-      kpi('Your share (booked / trending)', fmtMoney(data.totals.your_cash_flow) + ' / ' + fmtMoney(data.totals.your_trending_cash_flow), 'after ownership splits', data.totals.your_trending_cash_flow >= 0 ? 'success' : 'danger'),
-      kpi('Portfolio NOI', fmtMoney(data.totals.noi), 'before mortgage interest'),
-      kpi('Total income', fmtMoney(data.totals.total_income), 'STR net + other income'),
+      kpi(`Year-end income ${data.year}`, fmtMoney(kIncome), 'season booked + off-season plan'),
+      kpi('Airbnb season booked', fmtMoney(kSeason), 'from your bookings — not editable'),
+      kpi('Off-season income', fmtMoney(kOff), 'the months you filled in'),
+      kpi('Year-end cash flow', fmtMoney(kCash), 'after all costs and mortgage interest', kCash >= 0 ? 'success' : 'danger'),
+      kpi('Your share', fmtMoney(kYours), 'after ownership splits', kYours >= 0 ? 'success' : 'danger'),
     ));
 
-    for (const b of data.buildings) root.appendChild(roiBuildingCard(b, data));
+    if (selectedProp && shown.length === 1 && shown[0].property_ids.length > 1) {
+      root.appendChild(el('div', { class: 'card warn-card', style: 'font-size:13px;' },
+        el('strong', null, `${shown[0].name} is one P&L covering ${shown[0].sub}. `),
+        `Costs below (mortgage, taxes, utilities) are for the whole building — they can't be split per door. The income breakdown shows ${selectedProp.nickname} separately.`));
+    }
+
+    for (const b of shown) root.appendChild(roiBuildingCard(b, data, roiProp ? Number(roiProp) : null));
+    if (!shown.length) root.appendChild(el('div', { class: 'card empty' }, 'No building is set up for that property yet.'));
   };
 
-  function roiBuildingCard(b, data) {
+  function roiBuildingCard(b, data, focusPropId) {
     const c = b.computed, inp = b.inputs || {};
-    const t = c.trending || {};
+    const inc = c.income;
     const card = el('div', { class: 'card' });
     card.appendChild(el('div', { class: 'between' },
-      el('div', null, el('h2', { style: 'margin-bottom:2px;' }, b.name), el('div', { class: 'muted', style: 'font-size:12px;' }, b.sub + (c.ownership_pct !== 100 ? ` • you own ${c.ownership_pct}%` : '') + (c.ownership_period && c.ownership_period.fraction < 1 ? ` • owned ${fmtDate(c.ownership_period.from)} → ${fmtDate(c.ownership_period.to)} (${Math.round(c.ownership_period.fraction * 100)}% of year — costs prorated)` : ''))),
+      el('div', null, el('h2', { style: 'margin-bottom:2px;' }, b.name), el('div', { class: 'muted', style: 'font-size:12px;' },
+        b.sub + (c.ownership_pct !== 100 ? ` • you own ${c.ownership_pct}%` : '') + (c.ownership_period && c.ownership_period.fraction < 1 ? ` • owned ${fmtDate(c.ownership_period.from)} → ${fmtDate(c.ownership_period.to)} (${Math.round(c.ownership_period.fraction * 100)}% of year — costs prorated)` : ''))),
       el('div', { class: 'kpi-mini-row' },
-        roiMini('Cash flow (booked)', fmtMoney(c.cash_flow), c.cash_flow >= 0 ? 'success' : 'danger'),
-        roiMini('Trending', fmtMoney(t.cash_flow), t.cash_flow >= 0 ? 'success' : 'danger'),
-        roiMini('Cash-on-cash (trend)', t.cash_on_cash == null ? '—' : (t.cash_on_cash * 100).toFixed(1) + '%', t.cash_on_cash == null ? null : t.cash_on_cash >= 0.08 ? 'success' : 'warn'),
+        roiMini('Year-end income', fmtMoney(inc.year_total)),
+        roiMini('Year-end cash flow', fmtMoney(c.year_cash_flow), c.year_cash_flow >= 0 ? 'success' : 'danger'),
+        roiMini('Cash-on-cash', c.year_cash_on_cash == null ? '—' : (c.year_cash_on_cash * 100).toFixed(1) + '%', c.year_cash_on_cash == null ? null : c.year_cash_on_cash >= 0.08 ? 'success' : 'warn'),
         roiMini('Cap rate', c.cap_rate == null ? '—' : (c.cap_rate * 100).toFixed(1) + '%', null),
-        c.ownership_pct !== 100 ? roiMini('Your share (trend)', fmtMoney(c.your_trending_cash_flow), c.your_trending_cash_flow >= 0 ? 'success' : 'danger') : null)));
+        c.ownership_pct !== 100 ? roiMini('Your share', fmtMoney(c.your_year_cash_flow), c.your_year_cash_flow >= 0 ? 'success' : 'danger') : null)));
     if (inp.notes) card.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin:4px 0 10px;font-style:italic;' }, '📝 ' + inp.notes));
 
     const grid = el('div', { class: 'roi-grid' });
     const money = v => fmtMoney(v);
     const roLine = (label, val, cls) => el('div', { class: 'stat-line ' + (cls || '') }, el('span', null, label), el('strong', null, money(val)));
 
-    // Left: P&L (computed income + editable expense lines)
     const pnl = el('div', { class: 'roi-pnl' });
-    pnl.appendChild(el('h3', null, `Income — STR net of ${money(c.platform_fees)} platform fees`));
-    // Seasonal segments
-    pnl.appendChild(roLine(c.segments.pre.label, c.segments.pre.revenue));
-    pnl.appendChild(roLine(c.segments.season.label, c.segments.season.revenue));
-    pnl.appendChild(roLine(c.segments.post.label, c.segments.post.revenue));
-    // Per-property split (4488 = Retreat + Hideaway)
-    if (c.by_property.length > 1) {
-      pnl.appendChild(el('div', { class: 'muted', style: 'font-size:12px;padding:2px 0 4px;' },
-        'By property: ' + c.by_property.map(p => `${p.nickname} ${money(p.total)}`).join(' • ')));
-    }
-    // Expandable monthly breakdown
-    const monthlyWrap = el('div', { class: 'roi-monthly hidden' });
-    const mNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    const mtbl = el('table', { class: 'roi-monthly-table' });
-    mtbl.appendChild(el('thead', null, el('tr', null,
-      el('th', null, 'Month'),
-      ...c.by_property.map(p => el('th', { class: 'num' }, p.nickname)),
-      c.by_property.length > 1 ? el('th', { class: 'num' }, 'Total') : null)));
-    const mtb = el('tbody');
-    mNames.forEach((mn, i) => {
-      if (!c.monthly_total[i] && !c.by_property.some(p => p.monthly[i])) return; // skip $0 months
-      mtb.appendChild(el('tr', null,
-        el('td', null, mn),
-        ...c.by_property.map(p => el('td', { class: 'num' }, money(p.monthly[i]))),
-        c.by_property.length > 1 ? el('td', { class: 'num' }, el('strong', null, money(c.monthly_total[i]))) : null));
-    });
-    mtb.appendChild(el('tr', null,
-      el('td', null, el('strong', null, 'Year')),
-      ...c.by_property.map(p => el('td', { class: 'num' }, el('strong', null, money(p.total)))),
-      c.by_property.length > 1 ? el('td', { class: 'num' }, el('strong', null, money(c.str_net))) : null));
-    mtbl.appendChild(mtb);
-    monthlyWrap.appendChild(mtbl);
-    const expandBtn = el('button', { class: 'btn-ghost small', type: 'button', style: 'margin:4px 0;' }, '▸ Monthly breakdown');
-    expandBtn.addEventListener('click', () => {
-      const open = monthlyWrap.classList.toggle('hidden');
-      expandBtn.textContent = (open ? '▸' : '▾') + ' Monthly breakdown';
-    });
-    pnl.appendChild(expandBtn);
-    pnl.appendChild(monthlyWrap);
+    const fcInputs = {};
+
+    // --- income, in the order the year actually happens ---
+    pnl.appendChild(el('h3', null, `How ${data.year} finishes`));
+
+    const monthBlock = (block) => {
+      const wrap = el('div', { class: 'roi-months' });
+      block.months.forEach(r => {
+        const i = el('input', {
+          type: 'number', step: '0.01',
+          value: r.manual == null ? '' : String(r.manual),
+          placeholder: r.booked ? String(Math.round(r.booked)) : '0',
+          title: r.booked ? `${r.label}: ${fmtMoney(r.booked)} already booked. Type a number to override it.` : `${r.label}: nothing booked. Type the rent you expect.`,
+        });
+        fcInputs[r.month] = i;
+        wrap.appendChild(el('div', { class: 'roi-month' },
+          el('span', null, r.label),
+          i,
+          el('em', { class: 'roi-month-src' }, r.source === 'manual' ? 'yours' : (r.booked ? 'booked' : ''))));
+      });
+      return wrap;
+    };
+
+    pnl.appendChild(el('div', { class: 'stat-line roi-block-head' }, el('span', null, inc.pre.label), el('strong', null, money(inc.pre.total))));
+    pnl.appendChild(monthBlock(inc.pre));
+
+    pnl.appendChild(el('div', { class: 'stat-line roi-block-head season' },
+      el('span', null, inc.season.label),
+      el('strong', null, money(inc.season.booked))));
+    pnl.appendChild(el('div', { class: 'muted', style: 'font-size:12px;padding:2px 0 8px;' },
+      'Straight from your bookings, net of platform fees — the same figure on the Dashboard and Money tabs.',
+      inc.season.remaining_potential > 0 ? ` Another ${money(inc.season.remaining_potential)} is still open in 3+ night gaps.` : ''));
+
+    pnl.appendChild(el('div', { class: 'stat-line roi-block-head' }, el('span', null, inc.post.label), el('strong', null, money(inc.post.total))));
+    pnl.appendChild(monthBlock(inc.post));
 
     const otherIncome = roiInput(inp.other_income);
     pnl.appendChild(roiEditLine('Other income' + (inp.other_income_note ? ` — ${inp.other_income_note}` : ''), otherIncome));
-    pnl.appendChild(roLine('Total income (booked)', c.total_income, 'roi-total'));
+    pnl.appendChild(roLine(`Year-end income ${data.year}`, inc.year_total, 'roi-total'));
 
-    // Forecast lines → trending. Each off-season month is editable individually
-    // (e.g. long-term tenant rent Jan–May); trending uses max(booked, forecast) per month.
-    pnl.appendChild(el('h3', { style: 'margin-top:12px;' }, 'Forecast (feeds the trending number)'));
-    const fc = c.forecast || { pre_months: [], post_months: [] };
-    if (fc.legacy_mode) {
-      pnl.appendChild(el('div', { class: 'muted', style: 'font-size:12px;padding:2px 0;' },
-        'Currently using your old single pre/post-season figures — enter monthly amounts below and Save to switch to per-month forecasting.'));
+    // per-property split for shared buildings
+    if (c.by_property.length > 1) {
+      pnl.appendChild(el('div', { class: 'muted', style: 'font-size:12px;padding:4px 0;' },
+        'Season income by door: ' + c.by_property.map(p =>
+          (focusPropId === p.id ? '▸ ' : '') + `${p.nickname} ${money(p.total)}`).join(' • ')));
     }
-    const fcInputs = {};
-    const fcMonthRow = (title, months, total) => {
-      const row = el('div', { class: 'roi-fc-months' });
-      months.forEach(r => {
-        const i = el('input', { type: 'number', step: '0.01', value: r.forecast ? String(r.forecast) : '', placeholder: r.actual ? String(Math.round(r.actual)) : '0', title: r.label + (r.actual ? ` — ${fmtMoney(r.actual)} already booked; trending uses the higher of booked vs forecast` : ' — nothing booked yet') });
-        fcInputs[r.month] = i;
-        row.appendChild(el('div', { class: 'roi-fc-month' }, el('span', null, r.label), i));
-      });
-      return el('div', { class: 'roi-fc-group' },
-        el('div', { class: 'stat-line' }, el('span', null, title), el('strong', null, fmtMoney(total || 0))),
-        row);
-    };
-    pnl.appendChild(fcMonthRow('Before season — monthly (LTR rent, winter stays…)', fc.pre_months, fc.pre_total));
-    pnl.appendChild(fcMonthRow('After season — monthly (Oct–Dec)', fc.post_months, fc.post_total));
-    pnl.appendChild(roLine('Remaining season potential (3+ night gaps)', c.potential_remaining_season));
-    pnl.appendChild(roLine('Trending income (gaps fill + forecasts land)', t.income, 'roi-total'));
 
-    pnl.appendChild(el('h3', { style: 'margin-top:12px;' }, 'Operating expenses' + (c.ownership_period && c.ownership_period.fraction < 1 ? ` (annual inputs × ${Math.round(c.ownership_period.fraction * 100)}% owned)` : '')));
+    // --- costs ---
+    pnl.appendChild(el('h3', { style: 'margin-top:14px;' }, 'Operating expenses' + (c.ownership_period && c.ownership_period.fraction < 1 ? ` (annual inputs × ${Math.round(c.ownership_period.fraction * 100)}% owned)` : '')));
     const itemInputs = {};
     for (const it of data.expense_items) {
       itemInputs[it.key] = roiInput(inp[it.key]);
@@ -2941,13 +2952,16 @@ Matt`;
       pnl.appendChild(roiEditLine(shown, itemInputs[it.key]));
     }
     pnl.appendChild(roLine('STR costs tracked in app (cleaning, supplies…)', c.tracked_costs));
-    pnl.appendChild(roLine('NOI (booked income − operating costs)', c.noi, 'roi-total'));
+    pnl.appendChild(roLine('Total operating costs', -c.total_opex, 'roi-total'));
     pnl.appendChild(roLine(`Mortgage interest (${c.interest_source})`, -c.mortgage_interest));
-    pnl.appendChild(roLine('Cash flow (booked)', c.cash_flow, 'roi-grand ' + (c.cash_flow >= 0 ? 'pos' : 'neg')));
-    pnl.appendChild(roLine('Cash flow (trending)', t.cash_flow, 'roi-grand ' + (t.cash_flow >= 0 ? 'pos' : 'neg')));
+    pnl.appendChild(roLine(`Year-end cash flow ${data.year}`, c.year_cash_flow, 'roi-grand ' + (c.year_cash_flow >= 0 ? 'pos' : 'neg')));
+    if (inc.season.remaining_potential > 0) {
+      pnl.appendChild(el('div', { class: 'muted', style: 'font-size:12px;text-align:right;' },
+        `${money(c.trending.cash_flow)} if the remaining ${money(inc.season.remaining_potential)} of season gaps also sell.`));
+    }
     grid.appendChild(pnl);
 
-    // Right: financing & return inputs
+    // --- financing ---
     const fin = el('div', { class: 'roi-fin' });
     fin.appendChild(el('h3', null, 'Financing & return basis'));
     const value = roiInput(inp.property_value), debt = roiInput(inp.debt_balance);
@@ -2966,11 +2980,15 @@ Matt`;
     fin.appendChild(roiEditLine('Owned from (blank = Jan 1)', ownedFrom));
     fin.appendChild(roiEditLine('Owned until (blank = Dec 31)', ownedTo));
     fin.appendChild(el('div', { class: 'muted', style: 'font-size:12px;margin-top:8px;' },
-      `Equity ${money(c.equity)} • return basis: ${c.cash_basis}. Cash flow is NOI minus interest only — principal paydown builds equity on top. Trending assumes the remaining 3+ night season blocks fill and off-season forecasts land (uses whichever is higher: booked or forecast).`));
+      `Equity ${money(c.equity)} • return basis: ${c.cash_basis}. Cash flow is income minus operating costs and mortgage interest — principal paydown builds equity on top.`));
     const saveBtn = el('button', { class: 'btn-primary', style: 'margin-top:12px;' }, 'Save ' + b.name);
     saveBtn.addEventListener('click', async () => {
+      // Blank stays blank so the month falls back to what's booked; a typed 0 means zero.
       const forecast_monthly = {};
-      for (const m of Object.keys(fcInputs)) forecast_monthly[m] = Number(fcInputs[m].value) || 0;
+      for (const m of Object.keys(fcInputs)) {
+        const raw = fcInputs[m].value.trim();
+        forecast_monthly[m] = raw === '' ? null : (Number(raw) || 0);
+      }
       const payload = {
         other_income: Number(otherIncome.value) || 0,
         forecast_monthly,
